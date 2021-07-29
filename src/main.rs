@@ -2,15 +2,19 @@ use ash::version::{EntryV1_0, InstanceV1_0};
 use ash::vk;
 use std::ffi::CString;
 use std::ptr;
+use validation::{check_validation_layers_support, VALIDATION_ON};
 use winit::event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
 mod platform;
+mod validation;
 
 const WINDOW_WIDTH: u32 = 800;
 const WINDOW_HEIGHT: u32 = 600;
 const WINDOW_NAME: &str = "Vulkan test";
 const ENGINE_NAME: &str = "No engine";
+
+const REQUIRED_VALIDATIONS: [&'static str; 1] = ["VK_LAYER_KHRONOS_validation"];
 
 struct VulkanApp {
     entry: ash::Entry,
@@ -19,7 +23,7 @@ struct VulkanApp {
 
 impl VulkanApp {
     pub fn new() -> VulkanApp {
-        let entry = unsafe { ash::Entry::new() }.unwrap();
+        let entry = unsafe { ash::Entry::new() }.expect("Could not load Vulkan library");
         let instance = create_instance(&entry);
         VulkanApp { entry, instance }
     }
@@ -63,6 +67,9 @@ impl Drop for VulkanApp {
 }
 
 fn create_instance(entry: &ash::Entry) -> ash::Instance {
+    if VALIDATION_ON && !check_validation_layers_support(entry, &REQUIRED_VALIDATIONS[..]) {
+        panic!("Some validation layers requested are not available");
+    }
     let window_name = CString::new(WINDOW_NAME).unwrap();
     let engine_name = CString::new(ENGINE_NAME).unwrap();
     let app_info = vk::ApplicationInfo {
@@ -75,13 +82,29 @@ fn create_instance(entry: &ash::Entry) -> ash::Instance {
         api_version: vk::API_VERSION_1_2,
     };
     let required_extensions = platform::winit_get_required_extension_names();
+    let requested_val_layers_names = REQUIRED_VALIDATIONS
+        .iter()
+        .map(|x| CString::new(*x).unwrap())
+        .collect::<Vec<_>>();
+    let requested_val_layers = requested_val_layers_names
+        .iter()
+        .map(|x| x.as_ptr())
+        .collect::<Vec<_>>();
     let creation_info = vk::InstanceCreateInfo {
         s_type: vk::StructureType::INSTANCE_CREATE_INFO,
         p_next: ptr::null(),
         flags: vk::InstanceCreateFlags::empty(),
         p_application_info: &app_info,
-        enabled_layer_count: 0,
-        pp_enabled_layer_names: ptr::null(),
+        enabled_layer_count: if VALIDATION_ON {
+            requested_val_layers.len() as u32
+        } else {
+            0
+        },
+        pp_enabled_layer_names: if VALIDATION_ON {
+            requested_val_layers.as_ptr()
+        } else {
+            ptr::null()
+        },
         enabled_extension_count: required_extensions.len() as u32,
         pp_enabled_extension_names: required_extensions.as_ptr(),
     };
@@ -95,5 +118,6 @@ fn create_instance(entry: &ash::Entry) -> ash::Instance {
 fn main() {
     let event_loop = EventLoop::new();
     VulkanApp::init_window(&event_loop);
+    let instance = VulkanApp::new();
     VulkanApp::main_loop(event_loop);
 }
