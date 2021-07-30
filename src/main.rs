@@ -14,18 +14,34 @@ const WINDOW_HEIGHT: u32 = 600;
 const WINDOW_NAME: &str = "Vulkan test";
 const ENGINE_NAME: &str = "No engine";
 
-const REQUIRED_VALIDATIONS: [&'static str; 1] = ["VK_LAYER_KHRONOS_validation"];
+const REQUIRED_VALIDATIONS: [&str; 1] = ["VK_LAYER_KHRONOS_validation"];
+
+struct QueueFamilyIndices {
+    graphics_family: Option<usize>,
+}
+
+impl QueueFamilyIndices {
+    fn is_complete(&self) -> bool {
+        self.graphics_family.is_some()
+    }
+}
 
 struct VulkanApp {
     entry: ash::Entry,
     instance: ash::Instance,
+    p_device: vk::PhysicalDevice,
 }
 
 impl VulkanApp {
     pub fn new() -> VulkanApp {
         let entry = unsafe { ash::Entry::new() }.expect("Could not load Vulkan library");
         let instance = create_instance(&entry);
-        VulkanApp { entry, instance }
+        let p_device = pick_physical_device(&instance);
+        VulkanApp {
+            entry,
+            instance,
+            p_device,
+        }
     }
 
     pub fn init_window(event_loop: &EventLoop<()>) -> Window {
@@ -81,7 +97,7 @@ fn create_instance(entry: &ash::Entry) -> ash::Instance {
         engine_version: vk::make_version(0, 1, 0),
         api_version: vk::API_VERSION_1_2,
     };
-    let required_extensions = platform::winit_get_required_extension_names();
+    let required_extensions = platform::required_extension_names();
     let requested_val_layers_names = REQUIRED_VALIDATIONS
         .iter()
         .map(|x| CString::new(*x).unwrap())
@@ -113,6 +129,44 @@ fn create_instance(entry: &ash::Entry) -> ash::Instance {
             .create_instance(&creation_info, None)
             .expect("Failed to create instance")
     }
+}
+
+fn pick_physical_device(instance: &ash::Instance) -> vk::PhysicalDevice {
+    let physical_devices =
+        unsafe { instance.enumerate_physical_devices() }.expect("No physical devices found");
+    log::info!("Found {} GPUs in the system", physical_devices.len());
+    physical_devices
+        .into_iter()
+        .map(|device| (device, rate_physical_device_suitability(instance, device)))
+        .filter(|(_, score)| *score != 0)
+        .max_by_key(|(_, score)| *score)
+        .expect("No compatible physical devices found")
+        .0
+}
+
+fn rate_physical_device_suitability(instance: &ash::Instance, device: vk::PhysicalDevice) -> u32 {
+    let device_properties = unsafe { instance.get_physical_device_properties(device) };
+    let device_features = unsafe { instance.get_physical_device_features(device) };
+    let mut score = match device_properties.device_type {
+        vk::PhysicalDeviceType::DISCRETE_GPU => 1000,
+        vk::PhysicalDeviceType::INTEGRATED_GPU => 100,
+        vk::PhysicalDeviceType::CPU => 1,
+        vk::PhysicalDeviceType::OTHER => 10,
+        _ => 10,
+    };
+    let queues = find_queue_families(instance, device);
+    if device_features.geometry_shader == 0 || !queues.is_complete() {
+        score = 0;
+    }
+    score
+}
+
+fn find_queue_families(instance: &ash::Instance, device: vk::PhysicalDevice) -> QueueFamilyIndices {
+    let queue_families = unsafe { instance.get_physical_device_queue_family_properties(device) };
+    let graphics_family = queue_families
+        .into_iter()
+        .position(|queue| queue.queue_flags.contains(vk::QueueFlags::GRAPHICS));
+    QueueFamilyIndices { graphics_family }
 }
 
 fn main() {
