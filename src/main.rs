@@ -1,8 +1,8 @@
-use ash::version::{EntryV1_0, InstanceV1_0};
+use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
 use ash::vk;
 use std::ffi::CString;
 use std::ptr;
-use validation::{check_validation_layers_support, VALIDATION_ON};
+use validation::{ValidationsRequested, VALIDATION_ON};
 use winit::event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
@@ -16,31 +16,50 @@ const ENGINE_NAME: &str = "No engine";
 
 const REQUIRED_VALIDATIONS: [&str; 1] = ["VK_LAYER_KHRONOS_validation"];
 
-struct QueueFamilyIndices {
+struct QueueFamilyIndicesIncomplete {
     graphics_family: Option<usize>,
 }
 
-impl QueueFamilyIndices {
+impl QueueFamilyIndicesIncomplete {
     fn is_complete(&self) -> bool {
         self.graphics_family.is_some()
     }
+
+    fn get_complete(self) -> Option<QueueFamilyIndices> {
+        if let Some(graphics) = self.graphics_family {
+            Some(QueueFamilyIndices {
+                graphics_family: graphics as u32,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+struct QueueFamilyIndices {
+    graphics_family: u32,
 }
 
 struct VulkanApp {
     entry: ash::Entry,
     instance: ash::Instance,
-    p_device: vk::PhysicalDevice,
+    device: ash::Device,
+    graphics_queue: vk::Queue,
 }
 
 impl VulkanApp {
     pub fn new() -> VulkanApp {
         let entry = unsafe { ash::Entry::new() }.expect("Could not load Vulkan library");
-        let instance = create_instance(&entry);
-        let p_device = pick_physical_device(&instance);
+        let validations = ValidationsRequested::new(&REQUIRED_VALIDATIONS[..]);
+        let instance = create_instance(&entry, &validations);
+        let physical_device = pick_physical_device(&instance);
+        let (device, graphics_queue) =
+            create_logical_device(&instance, physical_device, &validations);
         VulkanApp {
             entry,
             instance,
-            p_device,
+            device,
+            graphics_queue,
         }
     }
 
@@ -78,12 +97,15 @@ impl VulkanApp {
 
 impl Drop for VulkanApp {
     fn drop(&mut self) {
-        unsafe { self.instance.destroy_instance(None) };
+        unsafe {
+            self.device.destroy_device(None);
+            self.instance.destroy_instance(None);
+        };
     }
 }
 
-fn create_instance(entry: &ash::Entry) -> ash::Instance {
-    if VALIDATION_ON && !check_validation_layers_support(entry, &REQUIRED_VALIDATIONS[..]) {
+fn create_instance(entry: &ash::Entry, validations: &ValidationsRequested) -> ash::Instance {
+    if VALIDATION_ON && !validations.check_support(entry) {
         panic!("Some validation layers requested are not available");
     }
     let window_name = CString::new(WINDOW_NAME).unwrap();
@@ -98,26 +120,19 @@ fn create_instance(entry: &ash::Entry) -> ash::Instance {
         api_version: vk::API_VERSION_1_2,
     };
     let required_extensions = platform::required_extension_names();
-    let requested_val_layers_names = REQUIRED_VALIDATIONS
-        .iter()
-        .map(|x| CString::new(*x).unwrap())
-        .collect::<Vec<_>>();
-    let requested_val_layers = requested_val_layers_names
-        .iter()
-        .map(|x| x.as_ptr())
-        .collect::<Vec<_>>();
+
     let creation_info = vk::InstanceCreateInfo {
         s_type: vk::StructureType::INSTANCE_CREATE_INFO,
         p_next: ptr::null(),
         flags: vk::InstanceCreateFlags::empty(),
         p_application_info: &app_info,
         enabled_layer_count: if VALIDATION_ON {
-            requested_val_layers.len() as u32
+            validations.layers_ptr().len() as u32
         } else {
             0
         },
         pp_enabled_layer_names: if VALIDATION_ON {
-            requested_val_layers.as_ptr()
+            validations.layers_ptr().as_ptr()
         } else {
             ptr::null()
         },
@@ -161,17 +176,67 @@ fn rate_physical_device_suitability(instance: &ash::Instance, device: vk::Physic
     score
 }
 
-fn find_queue_families(instance: &ash::Instance, device: vk::PhysicalDevice) -> QueueFamilyIndices {
+fn find_queue_families(
+    instance: &ash::Instance,
+    device: vk::PhysicalDevice,
+) -> QueueFamilyIndicesIncomplete {
     let queue_families = unsafe { instance.get_physical_device_queue_family_properties(device) };
     let graphics_family = queue_families
         .into_iter()
         .position(|queue| queue.queue_flags.contains(vk::QueueFlags::GRAPHICS));
-    QueueFamilyIndices { graphics_family }
+    QueueFamilyIndicesIncomplete { graphics_family }
+}
+
+fn create_logical_device(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    validations: &ValidationsRequested,
+) -> (ash::Device, vk::Queue) {
+    let queue_families = find_queue_families(instance, physical_device)
+        .get_complete()
+        .unwrap();
+    let queue_priority = 1.0;
+    let queue_create_info = vk::DeviceQueueCreateInfo {
+        s_type: vk::StructureType::DEVICE_QUEUE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::DeviceQueueCreateFlags::empty(),
+        queue_family_index: queue_families.graphics_family,
+        queue_count: 1,
+        p_queue_priorities: &queue_priority,
+    };
+
+    let physical_features = vk::PhysicalDeviceFeatures {
+        ..Default::default()
+    };
+    let device_create_info = vk::DeviceCreateInfo {
+        s_type: vk::StructureType::DEVICE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::DeviceCreateFlags::empty(),
+        queue_create_info_count: 1,
+        p_queue_create_infos: &queue_create_info,
+        enabled_layer_count: if VALIDATION_ON {
+            validations.layers_ptr().len() as u32
+        } else {
+            0
+        },
+        pp_enabled_layer_names: if VALIDATION_ON {
+            validations.layers_ptr().as_ptr()
+        } else {
+            ptr::null()
+        },
+        enabled_extension_count: 0,
+        pp_enabled_extension_names: ptr::null(),
+        p_enabled_features: &physical_features,
+    };
+    let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }
+        .expect("Failed to create logical device");
+    let queue = unsafe { device.get_device_queue(queue_families.graphics_family, 0) };
+    (device, queue)
 }
 
 fn main() {
     let event_loop = EventLoop::new();
     VulkanApp::init_window(&event_loop);
-    let instance = VulkanApp::new();
+    let app = VulkanApp::new();
     VulkanApp::main_loop(event_loop);
 }
