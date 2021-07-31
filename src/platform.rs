@@ -1,8 +1,8 @@
 use ash::{self, vk};
-use std::ptr;
+use std::{os::raw::c_char, ptr};
 use winit::window::Window;
 
-pub fn required_extension_names() -> Vec<*const i8> {
+pub fn required_extension_names() -> Vec<*const c_char> {
     let retval;
     #[cfg(target_os = "macos")]
     {

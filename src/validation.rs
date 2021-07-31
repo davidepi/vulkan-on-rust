@@ -36,7 +36,7 @@ impl ValidationsRequested {
         let available_layers = layer_properties
             .iter()
             .map(|x| &x.layer_name[..])
-            .map(cstr_to_str)
+            .map(cchars_to_string)
             .collect::<HashSet<_>>();
         self.names
             .iter()
@@ -47,9 +47,9 @@ impl ValidationsRequested {
     }
 }
 
-fn cstr_to_str(cstr: &[c_char]) -> String {
+pub fn cchars_to_string(cchars: &[c_char]) -> String {
     let raw_string = unsafe {
-        let pointer = cstr.as_ptr();
+        let pointer = cchars.as_ptr();
         CStr::from_ptr(pointer)
     };
 

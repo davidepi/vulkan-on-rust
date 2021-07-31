@@ -1,8 +1,8 @@
 use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
-use ash::vk;
+use ash::vk::{self, SwapchainCreateInfoKHR};
 use platform::create_surface;
-use std::collections::BTreeSet;
-use std::ffi::CString;
+use std::collections::{BTreeSet, HashSet};
+use std::ffi::{CStr, CString};
 use std::ptr;
 use validation::{ValidationsRequested, VALIDATION_ON};
 use winit::event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent};
@@ -17,6 +17,21 @@ const WINDOW_NAME: &str = "Vulkan test";
 const ENGINE_NAME: &str = "No engine";
 
 const REQUIRED_VALIDATIONS: [&str; 1] = ["VK_LAYER_KHRONOS_validation"];
+fn device_required_features() -> Vec<&'static CStr> {
+    vec![ash::extensions::khr::Swapchain::name()]
+}
+
+struct SwapchainSupport {
+    capabilities: vk::SurfaceCapabilitiesKHR,
+    formats: Vec<vk::SurfaceFormatKHR>,
+    present_modes: Vec<vk::PresentModeKHR>,
+}
+
+struct DeviceWithCapabilities {
+    device: vk::PhysicalDevice,
+    swapchain: SwapchainSupport,
+    queue_family: QueueFamilyIndices,
+}
 
 struct QueueFamilyIndicesIncomplete {
     graphics_family: Option<usize>,
@@ -40,6 +55,7 @@ impl QueueFamilyIndicesIncomplete {
     }
 }
 
+#[derive(Clone, Copy)]
 struct QueueFamilyIndices {
     graphics_family: u32,
     present_family: u32,
@@ -73,6 +89,35 @@ impl Surface {
     }
 }
 
+struct Swapchain {
+    swapchain: vk::SwapchainKHR,
+    loader: ash::extensions::khr::Swapchain,
+    image_format: vk::Format,
+    extent: vk::Extent2D,
+}
+
+impl Swapchain {
+    fn new(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        create_info: &SwapchainCreateInfoKHR,
+    ) -> Swapchain {
+        let loader = ash::extensions::khr::Swapchain::new(instance, device);
+        let swapchain = unsafe { loader.create_swapchain(create_info, None) }
+            .expect("Failed to create swapchain");
+        Swapchain {
+            swapchain,
+            loader,
+            image_format: create_info.image_format,
+            extent: create_info.image_extent,
+        }
+    }
+
+    unsafe fn destroy(&self) {
+        self.loader.destroy_swapchain(self.swapchain, None);
+    }
+}
+
 struct VulkanApp {
     entry: ash::Entry,
     instance: ash::Instance,
@@ -80,6 +125,7 @@ struct VulkanApp {
     graphics_queue: vk::Queue,
     present_queue: vk::Queue,
     surface: Surface,
+    swapchain: Swapchain,
 }
 
 impl VulkanApp {
@@ -90,9 +136,12 @@ impl VulkanApp {
         let surface = Surface::new(&entry, &instance, window);
         let physical_device = pick_physical_device(&instance, &surface);
         let (device, queue_indices) =
-            create_logical_device(&instance, physical_device, &validations, &surface);
+            create_logical_device(&instance, &physical_device, &validations, &surface);
         let graphics_queue = unsafe { device.get_device_queue(queue_indices.graphics_family, 0) };
         let present_queue = unsafe { device.get_device_queue(queue_indices.present_family, 0) };
+        let swapchain = create_swapchain(&instance, &device, &physical_device, &surface);
+        let images = unsafe { swapchain.loader.get_swapchain_images(swapchain.swapchain) }
+            .expect("Failed to get images");
         VulkanApp {
             entry,
             instance,
@@ -100,6 +149,7 @@ impl VulkanApp {
             graphics_queue,
             present_queue,
             surface,
+            swapchain,
         }
     }
 
@@ -138,6 +188,7 @@ impl VulkanApp {
 impl Drop for VulkanApp {
     fn drop(&mut self) {
         unsafe {
+            self.swapchain.destroy();
             self.surface.destroy();
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
@@ -187,58 +238,86 @@ fn create_instance(entry: &ash::Entry, validations: &ValidationsRequested) -> as
     }
 }
 
-fn pick_physical_device(instance: &ash::Instance, surface: &Surface) -> vk::PhysicalDevice {
+fn pick_physical_device(instance: &ash::Instance, surface: &Surface) -> DeviceWithCapabilities {
     let physical_devices =
         unsafe { instance.enumerate_physical_devices() }.expect("No physical devices found");
     log::info!("Found {} GPUs in the system", physical_devices.len());
     physical_devices
         .into_iter()
-        .map(|device| {
-            (
-                device,
-                rate_physical_device_suitability(instance, device, surface),
-            )
-        })
-        .filter(|(_, score)| *score != 0)
-        .max_by_key(|(_, score)| *score)
+        .map(|device| rate_physical_device_suitability(instance, device, surface))
+        .flatten()
+        .max_by_key(|(score, _)| *score)
         .expect("No compatible physical devices found")
-        .0
+        .1
 }
 
 fn rate_physical_device_suitability(
     instance: &ash::Instance,
-    device: vk::PhysicalDevice,
+    physical_device: vk::PhysicalDevice,
     surface: &Surface,
-) -> u32 {
-    let device_properties = unsafe { instance.get_physical_device_properties(device) };
-    let device_features = unsafe { instance.get_physical_device_features(device) };
-    let mut score = match device_properties.device_type {
+) -> Option<(u32, DeviceWithCapabilities)> {
+    let device_properties = unsafe { instance.get_physical_device_properties(physical_device) };
+    let device_features = unsafe { instance.get_physical_device_features(physical_device) };
+    let score = match device_properties.device_type {
         vk::PhysicalDeviceType::DISCRETE_GPU => 1000,
         vk::PhysicalDeviceType::INTEGRATED_GPU => 100,
         vk::PhysicalDeviceType::CPU => 1,
         vk::PhysicalDeviceType::OTHER => 10,
         _ => 10,
     };
-    let queues = find_queue_families(instance, device, surface);
-    if device_features.geometry_shader == 0 || !queues.is_complete() {
-        score = 0;
+    if device_support_requested_extensions(instance, physical_device) {
+        let queue_family = find_queue_families(instance, physical_device, surface);
+        let swapchain = query_swapchain_capabilities(surface, physical_device);
+        if let Some(queue_family) = queue_family.get_complete() {
+            if !swapchain.formats.is_empty() && !swapchain.present_modes.is_empty() {
+                Some((
+                    score,
+                    DeviceWithCapabilities {
+                        device: physical_device,
+                        swapchain,
+                        queue_family,
+                    },
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
     }
-    score
+}
+
+fn device_support_requested_extensions(
+    instance: &ash::Instance,
+    device: vk::PhysicalDevice,
+) -> bool {
+    let available_extensions = unsafe { instance.enumerate_device_extension_properties(device) }
+        .expect("Failed to get device extensions")
+        .into_iter()
+        .map(|x| validation::cchars_to_string(&x.extension_name))
+        .collect::<HashSet<_>>();
+    !device_required_features()
+        .into_iter()
+        .map(|x| x.to_str().unwrap().to_string())
+        .any(|x| !available_extensions.contains(&x))
 }
 
 fn find_queue_families(
     instance: &ash::Instance,
-    device: vk::PhysicalDevice,
+    physical_device: vk::PhysicalDevice,
     surface: &Surface,
 ) -> QueueFamilyIndicesIncomplete {
-    let queue_families = unsafe { instance.get_physical_device_queue_family_properties(device) };
+    let queue_families =
+        unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
     let graphics_family = queue_families
         .iter()
         .position(|queue| queue.queue_flags.contains(vk::QueueFlags::GRAPHICS));
     let present_family = (0..queue_families.len()).into_iter().find(|x| unsafe {
         surface
             .loader
-            .get_physical_device_surface_support(device, *x as u32, surface.khr())
+            .get_physical_device_surface_support(physical_device, *x as u32, surface.khr())
             .unwrap()
     });
     QueueFamilyIndicesIncomplete {
@@ -249,13 +328,12 @@ fn find_queue_families(
 
 fn create_logical_device(
     instance: &ash::Instance,
-    physical_device: vk::PhysicalDevice,
+    device: &DeviceWithCapabilities,
     validations: &ValidationsRequested,
     surface: &Surface,
 ) -> (ash::Device, QueueFamilyIndices) {
-    let queue_families = find_queue_families(instance, physical_device, surface)
-        .get_complete()
-        .unwrap();
+    let physical_device = device.device;
+    let queue_families = device.queue_family;
     let queue_families_set = queue_families
         .as_array()
         .iter()
@@ -278,6 +356,10 @@ fn create_logical_device(
     let physical_features = vk::PhysicalDeviceFeatures {
         ..Default::default()
     };
+    let required_device_extensions = device_required_features()
+        .into_iter()
+        .map(|x| x.as_ptr())
+        .collect::<Vec<_>>();
     let device_create_info = vk::DeviceCreateInfo {
         s_type: vk::StructureType::DEVICE_CREATE_INFO,
         p_next: ptr::null(),
@@ -294,13 +376,113 @@ fn create_logical_device(
         } else {
             ptr::null()
         },
-        enabled_extension_count: 0,
-        pp_enabled_extension_names: ptr::null(),
+        enabled_extension_count: required_device_extensions.len() as u32,
+        pp_enabled_extension_names: required_device_extensions.as_ptr(),
         p_enabled_features: &physical_features,
     };
     let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }
         .expect("Failed to create logical device");
     (device, queue_families)
+}
+
+fn query_swapchain_capabilities(
+    surface: &Surface,
+    physical_device: vk::PhysicalDevice,
+) -> SwapchainSupport {
+    let (surface, loader) = (surface.surface, &surface.loader);
+    let capabilities =
+        unsafe { loader.get_physical_device_surface_capabilities(physical_device, surface) }
+            .expect("could not get surface capabilities");
+    let formats = unsafe { loader.get_physical_device_surface_formats(physical_device, surface) }
+        .expect("Could not get surface formats");
+    let present_modes =
+        unsafe { loader.get_physical_device_surface_present_modes(physical_device, surface) }
+            .expect("Failed to get present modes");
+    SwapchainSupport {
+        capabilities,
+        formats,
+        present_modes,
+    }
+}
+
+fn create_swapchain(
+    instance: &ash::Instance,
+    ldevice: &ash::Device,
+    device: &DeviceWithCapabilities,
+    surface: &Surface,
+) -> Swapchain {
+    let capabilities = &device.swapchain.capabilities;
+    let format = *device
+        .swapchain
+        .formats
+        .iter()
+        .find(|sf| {
+            sf.format == vk::Format::B8G8R8A8_SRGB
+                && sf.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+        })
+        .unwrap_or(device.swapchain.formats.first().unwrap());
+    let present_mode = *device
+        .swapchain
+        .present_modes
+        .iter()
+        .find(|&x| *x == vk::PresentModeKHR::MAILBOX)
+        .unwrap_or(&vk::PresentModeKHR::FIFO);
+    let extent = if capabilities.current_extent.width != u32::MAX {
+        capabilities.current_extent
+    } else {
+        vk::Extent2D {
+            width: WINDOW_WIDTH.clamp(
+                capabilities.min_image_extent.width,
+                capabilities.max_image_extent.width,
+            ),
+            height: WINDOW_HEIGHT.clamp(
+                capabilities.min_image_extent.height,
+                capabilities.max_image_extent.height,
+            ),
+        }
+    };
+    let image_count = if capabilities.max_image_count == 0 {
+        capabilities.min_image_count + 1
+    } else {
+        capabilities
+            .max_image_count
+            .max(capabilities.min_image_count + 1)
+    };
+    let queue_families_indices = [
+        device.queue_family.graphics_family,
+        device.queue_family.present_family,
+    ];
+    let (image_sharing_mode, queue_family_index_count, p_queue_family_indices) =
+        if device.queue_family.graphics_family != device.queue_family.present_family {
+            (
+                vk::SharingMode::CONCURRENT,
+                2,
+                queue_families_indices.as_ptr(),
+            )
+        } else {
+            (vk::SharingMode::EXCLUSIVE, 0, ptr::null())
+        };
+    let create_info = vk::SwapchainCreateInfoKHR {
+        s_type: vk::StructureType::SWAPCHAIN_CREATE_INFO_KHR,
+        p_next: ptr::null(),
+        flags: vk::SwapchainCreateFlagsKHR::default(),
+        surface: surface.khr(),
+        min_image_count: image_count,
+        image_format: format.format,
+        image_color_space: format.color_space,
+        image_extent: extent,
+        image_array_layers: 1,
+        image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        image_sharing_mode,
+        queue_family_index_count,
+        p_queue_family_indices,
+        pre_transform: capabilities.current_transform,
+        composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
+        present_mode,
+        clipped: vk::TRUE,
+        old_swapchain: vk::SwapchainKHR::null(),
+    };
+    Swapchain::new(instance, ldevice, &create_info)
 }
 
 fn main() {
