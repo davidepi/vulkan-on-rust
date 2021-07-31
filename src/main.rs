@@ -1,5 +1,8 @@
 use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
-use ash::vk::{self, ComponentMapping, ImageViewCreateFlags, SwapchainCreateInfoKHR};
+use ash::vk::{
+    self, ComponentMapping, ImageViewCreateFlags, PipelineShaderStageCreateFlags,
+    ShaderModuleCreateFlags, SwapchainCreateInfoKHR,
+};
 use platform::create_surface;
 use std::collections::{BTreeSet, HashSet};
 use std::ffi::{CStr, CString};
@@ -521,6 +524,48 @@ fn create_image_views(
         );
     }
     retval
+}
+
+fn create_graphics_pipeline(device: &ash::Device) {
+    let main_str = CString::new("main").unwrap();
+    let vertex_shader = include_bytes!("../target/shaders/triangle.vert.spv");
+    let fragment_shader = include_bytes!("../target/shaders/triangle.frag.spv");
+    let vertex_module = create_shader_module(device, vertex_shader);
+    let fragment_module = create_shader_module(device, fragment_shader);
+    let vertex_stage_create_info = vk::PipelineShaderStageCreateInfo {
+        s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: PipelineShaderStageCreateFlags::default(),
+        stage: vk::ShaderStageFlags::VERTEX,
+        module: vertex_module,
+        p_name: main_str.as_ptr(),
+        p_specialization_info: ptr::null(),
+    };
+    let fragment_stage_create_info = vk::PipelineShaderStageCreateInfo {
+        s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: PipelineShaderStageCreateFlags::default(),
+        stage: vk::ShaderStageFlags::FRAGMENT,
+        module: fragment_module,
+        p_name: main_str.as_ptr(),
+        p_specialization_info: ptr::null(),
+    };
+    unsafe {
+        device.destroy_shader_module(vertex_module, None);
+        device.destroy_shader_module(fragment_module, None);
+    }
+}
+
+fn create_shader_module(device: &ash::Device, shader_code: &[u8]) -> vk::ShaderModule {
+    let create_info = vk::ShaderModuleCreateInfo {
+        s_type: vk::StructureType::SHADER_MODULE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: ShaderModuleCreateFlags::default(),
+        code_size: shader_code.len(),
+        p_code: shader_code.as_ptr() as *const u32,
+    };
+    unsafe { device.create_shader_module(&create_info, None) }
+        .expect("Failed to create shader module")
 }
 
 fn main() {
