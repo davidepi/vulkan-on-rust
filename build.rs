@@ -1,4 +1,4 @@
-use std::{env, error::Error, path::PathBuf};
+use std::{error::Error, path::PathBuf};
 
 use shaderc::{self, ShaderKind};
 

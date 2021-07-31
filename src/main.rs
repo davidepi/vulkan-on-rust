@@ -1,7 +1,8 @@
 use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
 use ash::vk::{
-    self, ComponentMapping, ImageViewCreateFlags, PipelineShaderStageCreateFlags,
-    ShaderModuleCreateFlags, SwapchainCreateInfoKHR,
+    self, ComponentMapping, ImageViewCreateFlags, PipelineInputAssemblyStateCreateFlags,
+    PipelineRasterizationStateCreateInfo, PipelineShaderStageCreateFlags,
+    PipelineVertexInputStateCreateInfo, ShaderModuleCreateFlags, SwapchainCreateInfoKHR,
 };
 use platform::create_surface;
 use std::collections::{BTreeSet, HashSet};
@@ -526,13 +527,13 @@ fn create_image_views(
     retval
 }
 
-fn create_graphics_pipeline(device: &ash::Device) {
+fn create_graphics_pipeline(device: &ash::Device, swapchain: &Swapchain) {
     let main_str = CString::new("main").unwrap();
     let vertex_shader = include_bytes!("../target/shaders/triangle.vert.spv");
     let fragment_shader = include_bytes!("../target/shaders/triangle.frag.spv");
     let vertex_module = create_shader_module(device, vertex_shader);
     let fragment_module = create_shader_module(device, fragment_shader);
-    let vertex_stage_create_info = vk::PipelineShaderStageCreateInfo {
+    let vertex_stage_ci = vk::PipelineShaderStageCreateInfo {
         s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
         p_next: ptr::null(),
         flags: PipelineShaderStageCreateFlags::default(),
@@ -541,7 +542,7 @@ fn create_graphics_pipeline(device: &ash::Device) {
         p_name: main_str.as_ptr(),
         p_specialization_info: ptr::null(),
     };
-    let fragment_stage_create_info = vk::PipelineShaderStageCreateInfo {
+    let fragment_stage_ci = vk::PipelineShaderStageCreateInfo {
         s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
         p_next: ptr::null(),
         flags: PipelineShaderStageCreateFlags::default(),
@@ -550,7 +551,110 @@ fn create_graphics_pipeline(device: &ash::Device) {
         p_name: main_str.as_ptr(),
         p_specialization_info: ptr::null(),
     };
+    let vertex_info_ci = vk::PipelineVertexInputStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: Default::default(),
+        vertex_binding_description_count: 0,
+        p_vertex_binding_descriptions: ptr::null(),
+        vertex_attribute_description_count: 0,
+        p_vertex_attribute_descriptions: ptr::null(),
+    };
+    let input_assembly_ci = vk::PipelineInputAssemblyStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: Default::default(),
+        topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+        primitive_restart_enable: vk::FALSE,
+    };
+    let viewport = vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: swapchain.extent.width as f32,
+        height: swapchain.extent.height as f32,
+        min_depth: 0.0,
+        max_depth: 0.0,
+    };
+    let scissor = vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent: swapchain.extent,
+    };
+    let viewport_state_ci = vk::PipelineViewportStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: Default::default(),
+        viewport_count: 1,
+        p_viewports: &viewport,
+        scissor_count: 1,
+        p_scissors: &scissor,
+    };
+    let rasterizer_ci = vk::PipelineRasterizationStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: Default::default(),
+        depth_clamp_enable: vk::FALSE,
+        rasterizer_discard_enable: vk::TRUE,
+        polygon_mode: vk::PolygonMode::FILL,
+        cull_mode: vk::CullModeFlags::BACK,
+        front_face: vk::FrontFace::CLOCKWISE,
+        depth_bias_enable: vk::FALSE,
+        depth_bias_constant_factor: 0.0,
+        depth_bias_clamp: 0.0,
+        depth_bias_slope_factor: 0.0,
+        line_width: 1.0,
+    };
+    let multisampling_ci = vk::PipelineMultisampleStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: Default::default(),
+        rasterization_samples: vk::SampleCountFlags::TYPE_1,
+        sample_shading_enable: vk::FALSE,
+        min_sample_shading: 1.0,
+        p_sample_mask: ptr::null(),
+        alpha_to_coverage_enable: vk::FALSE,
+        alpha_to_one_enable: vk::FALSE,
+    };
+    let blending_settings = vk::PipelineColorBlendAttachmentState {
+        blend_enable: vk::FALSE,
+        src_color_blend_factor: vk::BlendFactor::ONE,
+        dst_color_blend_factor: vk::BlendFactor::ZERO,
+        color_blend_op: vk::BlendOp::ADD,
+        src_alpha_blend_factor: vk::BlendFactor::ONE,
+        dst_alpha_blend_factor: vk::BlendFactor::ZERO,
+        alpha_blend_op: vk::BlendOp::ADD,
+        color_write_mask: vk::ColorComponentFlags::all(),
+    };
+    let blending_ci = vk::PipelineColorBlendStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: Default::default(),
+        logic_op_enable: vk::FALSE,
+        logic_op: vk::LogicOp::COPY,
+        attachment_count: 1,
+        p_attachments: &blending_settings,
+        blend_constants: [0.0; 4],
+    };
+    let dynamic_states = vec![vk::DynamicState::VIEWPORT, vk::DynamicState::LINE_WIDTH];
+    let dynamic_state_ci = vk::PipelineDynamicStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: Default::default(),
+        dynamic_state_count: 2,
+        p_dynamic_states: dynamic_states.as_ptr(),
+    };
+    let layout_ci = vk::PipelineLayoutCreateInfo {
+        s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: Default::default(),
+        set_layout_count: 0,
+        p_set_layouts: ptr::null(),
+        push_constant_range_count: 0,
+        p_push_constant_ranges: ptr::null(),
+    };
+    let layout = unsafe { device.create_pipeline_layout(&layout_ci, None) }
+        .expect("Failed to create layout");
     unsafe {
+        device.destroy_pipeline_layout(layout, None);
         device.destroy_shader_module(vertex_module, None);
         device.destroy_shader_module(fragment_module, None);
     }
