@@ -1,5 +1,5 @@
 use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
-use ash::vk::{self, SwapchainCreateInfoKHR};
+use ash::vk::{self, ComponentMapping, ImageViewCreateFlags, SwapchainCreateInfoKHR};
 use platform::create_surface;
 use std::collections::{BTreeSet, HashSet};
 use std::ffi::{CStr, CString};
@@ -126,6 +126,7 @@ struct VulkanApp {
     present_queue: vk::Queue,
     surface: Surface,
     swapchain: Swapchain,
+    image_views: Vec<vk::ImageView>,
 }
 
 impl VulkanApp {
@@ -142,6 +143,7 @@ impl VulkanApp {
         let swapchain = create_swapchain(&instance, &device, &physical_device, &surface);
         let images = unsafe { swapchain.loader.get_swapchain_images(swapchain.swapchain) }
             .expect("Failed to get images");
+        let image_views = create_image_views(&device, &swapchain, &images);
         VulkanApp {
             entry,
             instance,
@@ -150,6 +152,7 @@ impl VulkanApp {
             present_queue,
             surface,
             swapchain,
+            image_views,
         }
     }
 
@@ -188,6 +191,9 @@ impl VulkanApp {
 impl Drop for VulkanApp {
     fn drop(&mut self) {
         unsafe {
+            self.image_views
+                .iter()
+                .for_each(|image_view| self.device.destroy_image_view(*image_view, None));
             self.swapchain.destroy();
             self.surface.destroy();
             self.device.destroy_device(None);
@@ -483,6 +489,38 @@ fn create_swapchain(
         old_swapchain: vk::SwapchainKHR::null(),
     };
     Swapchain::new(instance, ldevice, &create_info)
+}
+
+fn create_image_views(
+    device: &ash::Device,
+    swapchain: &Swapchain,
+    images: &[vk::Image],
+) -> Vec<vk::ImageView> {
+    let mut retval = Vec::with_capacity(images.len());
+    for image in images {
+        let subresource_range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let create_info = vk::ImageViewCreateInfo {
+            s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
+            p_next: ptr::null(),
+            flags: ImageViewCreateFlags::default(),
+            image: *image,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: swapchain.image_format,
+            components: ComponentMapping::default(),
+            subresource_range,
+        };
+        retval.push(
+            unsafe { device.create_image_view(&create_info, None) }
+                .expect("Failed to create Image View"),
+        );
+    }
+    retval
 }
 
 fn main() {
