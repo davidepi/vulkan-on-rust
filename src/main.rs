@@ -2,7 +2,8 @@ use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
 use ash::vk::{
     self, ComponentMapping, ImageViewCreateFlags, PipelineInputAssemblyStateCreateFlags,
     PipelineRasterizationStateCreateInfo, PipelineShaderStageCreateFlags,
-    PipelineVertexInputStateCreateInfo, ShaderModuleCreateFlags, SwapchainCreateInfoKHR,
+    PipelineVertexInputStateCreateInfo, SampleCountFlags, ShaderModuleCreateFlags,
+    SwapchainCreateInfoKHR,
 };
 use platform::create_surface;
 use std::collections::{BTreeSet, HashSet};
@@ -131,6 +132,7 @@ struct VulkanApp {
     surface: Surface,
     swapchain: Swapchain,
     image_views: Vec<vk::ImageView>,
+    render_pass: vk::RenderPass,
 }
 
 impl VulkanApp {
@@ -148,6 +150,7 @@ impl VulkanApp {
         let images = unsafe { swapchain.loader.get_swapchain_images(swapchain.swapchain) }
             .expect("Failed to get images");
         let image_views = create_image_views(&device, &swapchain, &images);
+        let render_pass = create_render_pass(&device, &swapchain);
         VulkanApp {
             entry,
             instance,
@@ -157,6 +160,7 @@ impl VulkanApp {
             surface,
             swapchain,
             image_views,
+            render_pass,
         }
     }
 
@@ -195,6 +199,7 @@ impl VulkanApp {
 impl Drop for VulkanApp {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_render_pass(self.render_pass, None);
             self.image_views
                 .iter()
                 .for_each(|image_view| self.device.destroy_image_view(*image_view, None));
@@ -525,6 +530,49 @@ fn create_image_views(
         );
     }
     retval
+}
+
+fn create_render_pass(device: &ash::Device, swapchain: &Swapchain) -> vk::RenderPass {
+    let color_attachment = vk::AttachmentDescription {
+        flags: Default::default(),
+        format: swapchain.image_format,
+        samples: vk::SampleCountFlags::TYPE_1,
+        load_op: vk::AttachmentLoadOp::CLEAR,
+        store_op: vk::AttachmentStoreOp::STORE,
+        stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
+        stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
+        initial_layout: vk::ImageLayout::UNDEFINED,
+        final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
+    };
+    let color_attachment_ref = vk::AttachmentReference {
+        attachment: 0,
+        layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+    };
+    let subpass = vk::SubpassDescription {
+        flags: Default::default(),
+        pipeline_bind_point: vk::PipelineBindPoint::GRAPHICS,
+        input_attachment_count: 0,
+        p_input_attachments: ptr::null(),
+        color_attachment_count: 1,
+        p_color_attachments: &color_attachment_ref,
+        p_resolve_attachments: ptr::null(),
+        p_depth_stencil_attachment: ptr::null(),
+        preserve_attachment_count: 0,
+        p_preserve_attachments: ptr::null(),
+    };
+    let render_pass_ci = vk::RenderPassCreateInfo {
+        s_type: vk::StructureType::RENDER_PASS_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: Default::default(),
+        attachment_count: 1,
+        p_attachments: &color_attachment,
+        subpass_count: 1,
+        p_subpasses: &subpass,
+        dependency_count: 0,
+        p_dependencies: ptr::null(),
+    };
+    unsafe { device.create_render_pass(&render_pass_ci, None) }
+        .expect("Failed to create render pass")
 }
 
 fn create_graphics_pipeline(device: &ash::Device, swapchain: &Swapchain) {
