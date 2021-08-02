@@ -130,6 +130,7 @@ struct VulkanApp {
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    framebuffers: Vec<vk::Framebuffer>,
 }
 
 impl VulkanApp {
@@ -150,6 +151,7 @@ impl VulkanApp {
         let render_pass = create_render_pass(&device, &swapchain);
         let pipeline_layout = create_pipeline_layout(&device);
         let pipeline = create_graphics_pipeline(&device, &swapchain, render_pass, pipeline_layout);
+        let framebuffers = create_framebuffers(&device, &swapchain, &image_views[..], render_pass);
         VulkanApp {
             entry,
             instance,
@@ -162,6 +164,7 @@ impl VulkanApp {
             render_pass,
             pipeline_layout,
             pipeline,
+            framebuffers,
         }
     }
 
@@ -200,13 +203,16 @@ impl VulkanApp {
 impl Drop for VulkanApp {
     fn drop(&mut self) {
         unsafe {
+            self.framebuffers
+                .iter()
+                .for_each(|fb| self.device.destroy_framebuffer(*fb, None));
             self.device.destroy_pipeline(self.pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             self.device.destroy_render_pass(self.render_pass, None);
             self.image_views
                 .iter()
-                .for_each(|image_view| self.device.destroy_image_view(*image_view, None));
+                .for_each(|iv| self.device.destroy_image_view(*iv, None));
             self.swapchain.destroy();
             self.surface.destroy();
             self.device.destroy_device(None);
@@ -757,6 +763,33 @@ fn create_shader_module(device: &ash::Device, shader_code: &[u8]) -> vk::ShaderM
     };
     unsafe { device.create_shader_module(&create_info, None) }
         .expect("Failed to create shader module")
+}
+
+fn create_framebuffers(
+    device: &ash::Device,
+    swapchain: &Swapchain,
+    image_views: &[vk::ImageView],
+    render_pass: vk::RenderPass,
+) -> Vec<vk::Framebuffer> {
+    let mut retval = Vec::with_capacity(image_views.len());
+    for view in image_views {
+        let attachments = [*view];
+        let fb_ci = vk::FramebufferCreateInfo {
+            s_type: vk::StructureType::FRAMEBUFFER_CREATE_INFO,
+            p_next: ptr::null(),
+            flags: Default::default(),
+            render_pass,
+            attachment_count: 1,
+            p_attachments: attachments.as_ptr(),
+            width: swapchain.extent.width,
+            height: swapchain.extent.height,
+            layers: 1,
+        };
+        let fb = unsafe { device.create_framebuffer(&fb_ci, None) }
+            .expect("Failed to create frambebuffer");
+        retval.push(fb);
+    }
+    retval
 }
 
 fn main() {
