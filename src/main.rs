@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::ffi::{CStr, CString};
 use std::ptr;
 use validation::{ValidationsRequested, VALIDATION_ON};
-use winit::event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent};
+use winit::event::{Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
 mod platform;
@@ -15,7 +15,6 @@ const WINDOW_WIDTH: u32 = 800;
 const WINDOW_HEIGHT: u32 = 600;
 const WINDOW_NAME: &str = "Vulkan test";
 const ENGINE_NAME: &str = "No engine";
-
 const REQUIRED_VALIDATIONS: [&str; 1] = ["VK_LAYER_KHRONOS_validation"];
 fn device_required_features() -> Vec<&'static CStr> {
     vec![ash::extensions::khr::Swapchain::name()]
@@ -39,10 +38,6 @@ struct QueueFamilyIndicesIncomplete {
 }
 
 impl QueueFamilyIndicesIncomplete {
-    fn is_complete(&self) -> bool {
-        self.graphics_family.is_some() && self.present_family.is_some()
-    }
-
     fn get_complete(self) -> Option<QueueFamilyIndices> {
         if let (Some(graphics), Some(present)) = (self.graphics_family, self.present_family) {
             Some(QueueFamilyIndices {
@@ -119,11 +114,11 @@ impl Swapchain {
 }
 
 struct VulkanApp {
-    entry: ash::Entry,
     instance: ash::Instance,
     device: ash::Device,
     graphics_queue: vk::Queue,
     present_queue: vk::Queue,
+    window: Window,
     surface: Surface,
     swapchain: Swapchain,
     image_views: Vec<vk::ImageView>,
@@ -132,17 +127,20 @@ struct VulkanApp {
     pipeline: vk::Pipeline,
     framebuffers: Vec<vk::Framebuffer>,
     command_pool: vk::CommandPool,
+    command_buffers: Vec<vk::CommandBuffer>,
+    sem_img_available: vk::Semaphore,
+    sem_render_finish: vk::Semaphore,
 }
 
 impl VulkanApp {
-    pub fn new(window: &Window) -> VulkanApp {
+    pub fn new(window: Window) -> VulkanApp {
         let entry = unsafe { ash::Entry::new() }.expect("Could not load Vulkan library");
         let validations = ValidationsRequested::new(&REQUIRED_VALIDATIONS[..]);
         let instance = create_instance(&entry, &validations);
-        let surface = Surface::new(&entry, &instance, window);
+        let surface = Surface::new(&entry, &instance, &window);
         let physical_device = pick_physical_device(&instance, &surface);
         let (device, queue_indices) =
-            create_logical_device(&instance, &physical_device, &validations, &surface);
+            create_logical_device(&instance, &physical_device, &validations);
         let graphics_queue = unsafe { device.get_device_queue(queue_indices.graphics_family, 0) };
         let present_queue = unsafe { device.get_device_queue(queue_indices.present_family, 0) };
         let swapchain = create_swapchain(&instance, &device, &physical_device, &surface);
@@ -154,7 +152,9 @@ impl VulkanApp {
         let pipeline = create_graphics_pipeline(&device, &swapchain, render_pass, pipeline_layout);
         let framebuffers = create_framebuffers(&device, &swapchain, &image_views, render_pass);
         let command_pool = create_command_pool(&device, &physical_device);
-        create_command_buffers(
+        let sem_img_available = create_semaphore(&device);
+        let sem_render_finish = create_semaphore(&device);
+        let command_buffers = create_command_buffers(
             &device,
             command_pool,
             &framebuffers,
@@ -163,11 +163,11 @@ impl VulkanApp {
             pipeline,
         );
         VulkanApp {
-            entry,
             instance,
             device,
             graphics_queue,
             present_queue,
+            window,
             surface,
             swapchain,
             image_views,
@@ -176,6 +176,9 @@ impl VulkanApp {
             pipeline,
             framebuffers,
             command_pool,
+            command_buffers,
+            sem_img_available,
+            sem_render_finish,
         }
     }
 
@@ -187,25 +190,66 @@ impl VulkanApp {
             .expect("Failed to create window")
     }
 
+    fn draw_frame(&self) {
+        let (image_index, _) = unsafe {
+            self.swapchain.loader.acquire_next_image(
+                self.swapchain.swapchain,
+                u64::MAX,
+                self.sem_img_available,
+                vk::Fence::null(),
+            )
+        }
+        .expect("Failed to acquire next image");
+        let wait_sem = [self.sem_img_available];
+        let signal_sem = [self.sem_render_finish];
+        let wait_mask = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        let submit_ci = vk::SubmitInfo {
+            s_type: vk::StructureType::SUBMIT_INFO,
+            p_next: ptr::null(),
+            wait_semaphore_count: wait_sem.len() as u32,
+            p_wait_semaphores: wait_sem.as_ptr(),
+            p_wait_dst_stage_mask: wait_mask.as_ptr(),
+            command_buffer_count: 1,
+            p_command_buffers: &self.command_buffers[image_index as usize],
+            signal_semaphore_count: 1,
+            p_signal_semaphores: signal_sem.as_ptr(),
+        };
+        let swapchains = [self.swapchain.swapchain];
+        let present_ci = vk::PresentInfoKHR {
+            s_type: vk::StructureType::PRESENT_INFO_KHR,
+            p_next: ptr::null(),
+            wait_semaphore_count: signal_sem.len() as u32,
+            p_wait_semaphores: signal_sem.as_ptr(),
+            swapchain_count: swapchains.len() as u32,
+            p_swapchains: swapchains.as_ptr(),
+            p_image_indices: &image_index,
+            p_results: ptr::null_mut(),
+        };
+        unsafe {
+            self.device
+                .queue_submit(self.graphics_queue, &[submit_ci], vk::Fence::null())
+                .expect("Failed to submit graphicsqueue");
+            self.swapchain
+                .loader
+                .queue_present(self.present_queue, &present_ci)
+                .expect("Failed to submit present queue");
+            self.device
+                .queue_wait_idle(self.present_queue)
+                .expect("Failed to wait for the queue");
+        }
+    }
+
     pub fn main_loop(self, event_loop: EventLoop<()>) -> ! {
         event_loop.run(move |event, _, control_flow| match event {
-            Event::WindowEvent { event, .. } => match event {
-                WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
-                WindowEvent::KeyboardInput { input, .. } => match input {
-                    KeyboardInput {
-                        virtual_keycode,
-                        state,
-                        ..
-                    } => match (virtual_keycode, state) {
-                        (Some(VirtualKeyCode::Escape), ElementState::Pressed) => {
-                            dbg!();
-                            *control_flow = ControlFlow::Exit
-                        }
-                        _ => {}
-                    },
-                },
-                _ => {}
-            },
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                window_id: _,
+            } => *control_flow = ControlFlow::Exit,
+            Event::MainEventsCleared => self.window.request_redraw(),
+            Event::RedrawRequested(_) => self.draw_frame(),
+            Event::LoopDestroyed => {
+                unsafe { self.device.device_wait_idle() }.expect("Failed to wait idle")
+            }
             _ => (),
         })
     }
@@ -214,6 +258,8 @@ impl VulkanApp {
 impl Drop for VulkanApp {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_semaphore(self.sem_render_finish, None);
+            self.device.destroy_semaphore(self.sem_img_available, None);
             self.device.destroy_command_pool(self.command_pool, None);
             self.framebuffers
                 .iter()
@@ -294,7 +340,7 @@ fn rate_physical_device_suitability(
     surface: &Surface,
 ) -> Option<(u32, DeviceWithCapabilities)> {
     let device_properties = unsafe { instance.get_physical_device_properties(physical_device) };
-    let device_features = unsafe { instance.get_physical_device_features(physical_device) };
+    // let device_features = unsafe { instance.get_physical_device_features(physical_device) };
     let score = match device_properties.device_type {
         vk::PhysicalDeviceType::DISCRETE_GPU => 1000,
         vk::PhysicalDeviceType::INTEGRATED_GPU => 100,
@@ -367,7 +413,6 @@ fn create_logical_device(
     instance: &ash::Instance,
     device: &DeviceWithCapabilities,
     validations: &ValidationsRequested,
-    surface: &Surface,
 ) -> (ash::Device, QueueFamilyIndices) {
     let physical_device = device.device;
     let queue_families = device.queue_family;
@@ -457,7 +502,7 @@ fn create_swapchain(
             sf.format == vk::Format::B8G8R8A8_SRGB
                 && sf.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
         })
-        .unwrap_or(device.swapchain.formats.first().unwrap());
+        .unwrap_or_else(|| device.swapchain.formats.first().unwrap());
     let present_mode = *device
         .swapchain
         .present_modes
@@ -595,6 +640,15 @@ fn create_render_pass(device: &ash::Device, swapchain: &Swapchain) -> vk::Render
         preserve_attachment_count: 0,
         p_preserve_attachments: ptr::null(),
     };
+    let dependency = vk::SubpassDependency {
+        src_subpass: vk::SUBPASS_EXTERNAL,
+        dst_subpass: 0,
+        src_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        dst_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        src_access_mask: vk::AccessFlags::empty(),
+        dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        dependency_flags: vk::DependencyFlags::empty(),
+    };
     let render_pass_ci = vk::RenderPassCreateInfo {
         s_type: vk::StructureType::RENDER_PASS_CREATE_INFO,
         p_next: ptr::null(),
@@ -603,8 +657,8 @@ fn create_render_pass(device: &ash::Device, swapchain: &Swapchain) -> vk::Render
         p_attachments: &color_attachment,
         subpass_count: 1,
         p_subpasses: &subpass,
-        dependency_count: 0,
-        p_dependencies: ptr::null(),
+        dependency_count: 1,
+        p_dependencies: &dependency,
     };
     unsafe { device.create_render_pass(&render_pass_ci, None) }
         .expect("Failed to create render pass")
@@ -824,7 +878,7 @@ fn create_command_buffers(
     render_pass: vk::RenderPass,
     swapchain: &Swapchain,
     pipeline: vk::Pipeline,
-) {
+) -> Vec<vk::CommandBuffer> {
     let alloc_ci = vk::CommandBufferAllocateInfo {
         s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
         p_next: ptr::null(),
@@ -869,11 +923,21 @@ fn create_command_buffers(
                 .expect("Failed to record command_buffer");
         }
     }
+    cmd_buffers
+}
+
+fn create_semaphore(device: &ash::Device) -> vk::Semaphore {
+    let semaphore_ci = vk::SemaphoreCreateInfo {
+        s_type: vk::StructureType::SEMAPHORE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: Default::default(),
+    };
+    unsafe { device.create_semaphore(&semaphore_ci, None) }.expect("Failed to create semaphore")
 }
 
 fn main() {
     let event_loop = EventLoop::new();
     let window = VulkanApp::init_window(&event_loop);
-    let app = VulkanApp::new(&window);
+    let app = VulkanApp::new(window);
     app.main_loop(event_loop);
 }
