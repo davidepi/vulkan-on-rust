@@ -131,6 +131,7 @@ struct VulkanApp {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     framebuffers: Vec<vk::Framebuffer>,
+    command_pool: vk::CommandPool,
 }
 
 impl VulkanApp {
@@ -151,7 +152,16 @@ impl VulkanApp {
         let render_pass = create_render_pass(&device, &swapchain);
         let pipeline_layout = create_pipeline_layout(&device);
         let pipeline = create_graphics_pipeline(&device, &swapchain, render_pass, pipeline_layout);
-        let framebuffers = create_framebuffers(&device, &swapchain, &image_views[..], render_pass);
+        let framebuffers = create_framebuffers(&device, &swapchain, &image_views, render_pass);
+        let command_pool = create_command_pool(&device, &physical_device);
+        create_command_buffers(
+            &device,
+            command_pool,
+            &framebuffers,
+            render_pass,
+            &swapchain,
+            pipeline,
+        );
         VulkanApp {
             entry,
             instance,
@@ -165,6 +175,7 @@ impl VulkanApp {
             pipeline_layout,
             pipeline,
             framebuffers,
+            command_pool,
         }
     }
 
@@ -203,6 +214,7 @@ impl VulkanApp {
 impl Drop for VulkanApp {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_command_pool(self.command_pool, None);
             self.framebuffers
                 .iter()
                 .for_each(|fb| self.device.destroy_framebuffer(*fb, None));
@@ -790,6 +802,73 @@ fn create_framebuffers(
         retval.push(fb);
     }
     retval
+}
+
+fn create_command_pool(
+    device: &ash::Device,
+    physical_device: &DeviceWithCapabilities,
+) -> vk::CommandPool {
+    let pool_ci = vk::CommandPoolCreateInfo {
+        s_type: vk::StructureType::COMMAND_POOL_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: Default::default(),
+        queue_family_index: physical_device.queue_family.graphics_family,
+    };
+    unsafe { device.create_command_pool(&pool_ci, None) }.expect("Failed to create command pool")
+}
+
+fn create_command_buffers(
+    device: &ash::Device,
+    command_pool: vk::CommandPool,
+    fbs: &[vk::Framebuffer],
+    render_pass: vk::RenderPass,
+    swapchain: &Swapchain,
+    pipeline: vk::Pipeline,
+) {
+    let alloc_ci = vk::CommandBufferAllocateInfo {
+        s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
+        p_next: ptr::null(),
+        command_pool,
+        level: vk::CommandBufferLevel::PRIMARY,
+        command_buffer_count: fbs.len() as u32,
+    };
+    let cmd_buffers = unsafe { device.allocate_command_buffers(&alloc_ci) }
+        .expect("Failed to allocate command buffers");
+    for i in 0..fbs.len() {
+        let command_buffer = cmd_buffers[i];
+        let framebuffer = fbs[i];
+        let begin_info = vk::CommandBufferBeginInfo {
+            s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
+            p_next: ptr::null(),
+            flags: Default::default(),
+            p_inheritance_info: ptr::null(),
+        };
+        let clear_value = vk::ClearValue::default();
+        let rp_begin = vk::RenderPassBeginInfo {
+            s_type: vk::StructureType::RENDER_PASS_BEGIN_INFO,
+            p_next: ptr::null(),
+            render_pass,
+            framebuffer,
+            render_area: vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: swapchain.extent,
+            },
+            clear_value_count: 1,
+            p_clear_values: &clear_value,
+        };
+        unsafe {
+            device
+                .begin_command_buffer(command_buffer, &begin_info)
+                .expect("Failed to begin command buffer");
+            device.cmd_begin_render_pass(command_buffer, &rp_begin, vk::SubpassContents::INLINE);
+            device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            device.cmd_draw(command_buffer, 3, 1, 0, 0);
+            device.cmd_end_render_pass(command_buffer);
+            device
+                .end_command_buffer(command_buffer)
+                .expect("Failed to record command_buffer");
+        }
+    }
 }
 
 fn main() {
