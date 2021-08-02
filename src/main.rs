@@ -15,6 +15,7 @@ const WINDOW_WIDTH: u32 = 800;
 const WINDOW_HEIGHT: u32 = 600;
 const WINDOW_NAME: &str = "Vulkan test";
 const ENGINE_NAME: &str = "No engine";
+const MAX_FRAMES_IN_FLIGHT: usize = 2;
 const REQUIRED_VALIDATIONS: [&str; 1] = ["VK_LAYER_KHRONOS_validation"];
 fn device_required_features() -> Vec<&'static CStr> {
     vec![ash::extensions::khr::Swapchain::name()]
@@ -128,8 +129,11 @@ struct VulkanApp {
     framebuffers: Vec<vk::Framebuffer>,
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
-    sem_img_available: vk::Semaphore,
-    sem_render_finish: vk::Semaphore,
+    sem_img_available: [vk::Semaphore; MAX_FRAMES_IN_FLIGHT],
+    sem_render_finish: [vk::Semaphore; MAX_FRAMES_IN_FLIGHT],
+    acquire_inflight: [vk::Fence; MAX_FRAMES_IN_FLIGHT],
+    images_inflight: [vk::Fence; MAX_FRAMES_IN_FLIGHT],
+    inflight_frame_no: usize,
 }
 
 impl VulkanApp {
@@ -154,6 +158,7 @@ impl VulkanApp {
         let command_pool = create_command_pool(&device, &physical_device);
         let sem_img_available = create_semaphore(&device);
         let sem_render_finish = create_semaphore(&device);
+        let acquire_inflight = create_fence(&device);
         let command_buffers = create_command_buffers(
             &device,
             command_pool,
@@ -179,6 +184,9 @@ impl VulkanApp {
             command_buffers,
             sem_img_available,
             sem_render_finish,
+            acquire_inflight,
+            images_inflight: [vk::Fence::null(); MAX_FRAMES_IN_FLIGHT],
+            inflight_frame_no: 0,
         }
     }
 
@@ -190,18 +198,40 @@ impl VulkanApp {
             .expect("Failed to create window")
     }
 
-    fn draw_frame(&self) {
+    fn draw_frame(&mut self) {
+        unsafe {
+            self.device
+                .wait_for_fences(
+                    &[self.acquire_inflight[self.inflight_frame_no]],
+                    true,
+                    u64::MAX,
+                )
+                .expect("Failed to wait for fence");
+        }
         let (image_index, _) = unsafe {
             self.swapchain.loader.acquire_next_image(
                 self.swapchain.swapchain,
                 u64::MAX,
-                self.sem_img_available,
+                self.sem_img_available[self.inflight_frame_no],
                 vk::Fence::null(),
             )
         }
         .expect("Failed to acquire next image");
-        let wait_sem = [self.sem_img_available];
-        let signal_sem = [self.sem_render_finish];
+        if self.images_inflight[self.inflight_frame_no] != vk::Fence::null() {
+            // this frame is currently in use, wait for it
+            unsafe {
+                self.device.wait_for_fences(
+                    &[self.images_inflight[self.inflight_frame_no]],
+                    true,
+                    u64::MAX,
+                )
+            }
+            .expect("Failed to wait for fence");
+        }
+        self.images_inflight[self.inflight_frame_no] =
+            self.acquire_inflight[self.inflight_frame_no];
+        let wait_sem = [self.sem_img_available[self.inflight_frame_no]];
+        let signal_sem = [self.sem_render_finish[self.inflight_frame_no]];
         let wait_mask = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let submit_ci = vk::SubmitInfo {
             s_type: vk::StructureType::SUBMIT_INFO,
@@ -227,7 +257,14 @@ impl VulkanApp {
         };
         unsafe {
             self.device
-                .queue_submit(self.graphics_queue, &[submit_ci], vk::Fence::null())
+                .reset_fences(&[self.acquire_inflight[self.inflight_frame_no]])
+                .expect("Failed to reset fence");
+            self.device
+                .queue_submit(
+                    self.graphics_queue,
+                    &[submit_ci],
+                    self.acquire_inflight[self.inflight_frame_no],
+                )
                 .expect("Failed to submit graphicsqueue");
             self.swapchain
                 .loader
@@ -237,9 +274,10 @@ impl VulkanApp {
                 .queue_wait_idle(self.present_queue)
                 .expect("Failed to wait for the queue");
         }
+        self.inflight_frame_no = (self.inflight_frame_no + 1) % MAX_FRAMES_IN_FLIGHT;
     }
 
-    pub fn main_loop(self, event_loop: EventLoop<()>) -> ! {
+    pub fn main_loop(mut self, event_loop: EventLoop<()>) -> ! {
         event_loop.run(move |event, _, control_flow| match event {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
@@ -258,8 +296,13 @@ impl VulkanApp {
 impl Drop for VulkanApp {
     fn drop(&mut self) {
         unsafe {
-            self.device.destroy_semaphore(self.sem_render_finish, None);
-            self.device.destroy_semaphore(self.sem_img_available, None);
+            for i in 0..MAX_FRAMES_IN_FLIGHT {
+                self.device
+                    .destroy_semaphore(self.sem_render_finish[i], None);
+                self.device
+                    .destroy_semaphore(self.sem_img_available[i], None);
+                self.device.destroy_fence(self.acquire_inflight[i], None);
+            }
             self.device.destroy_command_pool(self.command_pool, None);
             self.framebuffers
                 .iter()
@@ -919,13 +962,32 @@ fn create_command_buffers(
     cmd_buffers
 }
 
-fn create_semaphore(device: &ash::Device) -> vk::Semaphore {
-    let semaphore_ci = vk::SemaphoreCreateInfo {
-        s_type: vk::StructureType::SEMAPHORE_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: Default::default(),
-    };
-    unsafe { device.create_semaphore(&semaphore_ci, None) }.expect("Failed to create semaphore")
+fn create_semaphore(device: &ash::Device) -> [vk::Semaphore; MAX_FRAMES_IN_FLIGHT] {
+    let mut retval = [vk::Semaphore::null(); 2];
+    for i in 0..MAX_FRAMES_IN_FLIGHT {
+        let semaphore_ci = vk::SemaphoreCreateInfo {
+            s_type: vk::StructureType::SEMAPHORE_CREATE_INFO,
+            p_next: ptr::null(),
+            flags: Default::default(),
+        };
+        retval[i] = unsafe { device.create_semaphore(&semaphore_ci, None) }
+            .expect("Failed to create semaphore");
+    }
+    retval
+}
+
+fn create_fence(device: &ash::Device) -> [vk::Fence; MAX_FRAMES_IN_FLIGHT] {
+    let mut retval = [vk::Fence::null(); MAX_FRAMES_IN_FLIGHT];
+    for i in 0..MAX_FRAMES_IN_FLIGHT {
+        let fence_ci = vk::FenceCreateInfo {
+            s_type: vk::StructureType::FENCE_CREATE_INFO,
+            p_next: ptr::null(),
+            flags: vk::FenceCreateFlags::SIGNALED,
+        };
+        retval[i] =
+            unsafe { device.create_fence(&fence_ci, None) }.expect("Failed to create semaphore");
+    }
+    retval
 }
 
 fn main() {
