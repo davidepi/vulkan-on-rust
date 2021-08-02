@@ -1,10 +1,5 @@
 use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
-use ash::vk::{
-    self, ComponentMapping, ImageViewCreateFlags, PipelineInputAssemblyStateCreateFlags,
-    PipelineRasterizationStateCreateInfo, PipelineShaderStageCreateFlags,
-    PipelineVertexInputStateCreateInfo, SampleCountFlags, ShaderModuleCreateFlags,
-    SwapchainCreateInfoKHR,
-};
+use ash::vk;
 use platform::create_surface;
 use std::collections::{BTreeSet, HashSet};
 use std::ffi::{CStr, CString};
@@ -105,7 +100,7 @@ impl Swapchain {
     fn new(
         instance: &ash::Instance,
         device: &ash::Device,
-        create_info: &SwapchainCreateInfoKHR,
+        create_info: &vk::SwapchainCreateInfoKHR,
     ) -> Swapchain {
         let loader = ash::extensions::khr::Swapchain::new(instance, device);
         let swapchain = unsafe { loader.create_swapchain(create_info, None) }
@@ -133,6 +128,8 @@ struct VulkanApp {
     swapchain: Swapchain,
     image_views: Vec<vk::ImageView>,
     render_pass: vk::RenderPass,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
 }
 
 impl VulkanApp {
@@ -151,6 +148,8 @@ impl VulkanApp {
             .expect("Failed to get images");
         let image_views = create_image_views(&device, &swapchain, &images);
         let render_pass = create_render_pass(&device, &swapchain);
+        let pipeline_layout = create_pipeline_layout(&device);
+        let pipeline = create_graphics_pipeline(&device, &swapchain, render_pass, pipeline_layout);
         VulkanApp {
             entry,
             instance,
@@ -161,6 +160,8 @@ impl VulkanApp {
             swapchain,
             image_views,
             render_pass,
+            pipeline_layout,
+            pipeline,
         }
     }
 
@@ -199,6 +200,9 @@ impl VulkanApp {
 impl Drop for VulkanApp {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_pipeline(self.pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
             self.device.destroy_render_pass(self.render_pass, None);
             self.image_views
                 .iter()
@@ -517,11 +521,11 @@ fn create_image_views(
         let create_info = vk::ImageViewCreateInfo {
             s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
             p_next: ptr::null(),
-            flags: ImageViewCreateFlags::default(),
+            flags: vk::ImageViewCreateFlags::default(),
             image: *image,
             view_type: vk::ImageViewType::TYPE_2D,
             format: swapchain.image_format,
-            components: ComponentMapping::default(),
+            components: vk::ComponentMapping::default(),
             subresource_range,
         };
         retval.push(
@@ -530,6 +534,19 @@ fn create_image_views(
         );
     }
     retval
+}
+
+fn create_pipeline_layout(device: &ash::Device) -> vk::PipelineLayout {
+    let layout_ci = vk::PipelineLayoutCreateInfo {
+        s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: Default::default(),
+        set_layout_count: 0,
+        p_set_layouts: ptr::null(),
+        push_constant_range_count: 0,
+        p_push_constant_ranges: ptr::null(),
+    };
+    unsafe { device.create_pipeline_layout(&layout_ci, None) }.expect("Failed to create layout")
 }
 
 fn create_render_pass(device: &ash::Device, swapchain: &Swapchain) -> vk::RenderPass {
@@ -575,7 +592,12 @@ fn create_render_pass(device: &ash::Device, swapchain: &Swapchain) -> vk::Render
         .expect("Failed to create render pass")
 }
 
-fn create_graphics_pipeline(device: &ash::Device, swapchain: &Swapchain) {
+fn create_graphics_pipeline(
+    device: &ash::Device,
+    swapchain: &Swapchain,
+    render_pass: vk::RenderPass,
+    layout: vk::PipelineLayout,
+) -> vk::Pipeline {
     let main_str = CString::new("main").unwrap();
     let vertex_shader = include_bytes!("../target/shaders/triangle.vert.spv");
     let fragment_shader = include_bytes!("../target/shaders/triangle.frag.spv");
@@ -584,7 +606,7 @@ fn create_graphics_pipeline(device: &ash::Device, swapchain: &Swapchain) {
     let vertex_stage_ci = vk::PipelineShaderStageCreateInfo {
         s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
         p_next: ptr::null(),
-        flags: PipelineShaderStageCreateFlags::default(),
+        flags: vk::PipelineShaderStageCreateFlags::default(),
         stage: vk::ShaderStageFlags::VERTEX,
         module: vertex_module,
         p_name: main_str.as_ptr(),
@@ -593,13 +615,14 @@ fn create_graphics_pipeline(device: &ash::Device, swapchain: &Swapchain) {
     let fragment_stage_ci = vk::PipelineShaderStageCreateInfo {
         s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
         p_next: ptr::null(),
-        flags: PipelineShaderStageCreateFlags::default(),
+        flags: vk::PipelineShaderStageCreateFlags::default(),
         stage: vk::ShaderStageFlags::FRAGMENT,
         module: fragment_module,
         p_name: main_str.as_ptr(),
         p_specialization_info: ptr::null(),
     };
-    let vertex_info_ci = vk::PipelineVertexInputStateCreateInfo {
+    let shader_stages = [vertex_stage_ci, fragment_stage_ci];
+    let vertex_input_ci = vk::PipelineVertexInputStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         p_next: ptr::null(),
         flags: Default::default(),
@@ -690,29 +713,45 @@ fn create_graphics_pipeline(device: &ash::Device, swapchain: &Swapchain) {
         dynamic_state_count: 2,
         p_dynamic_states: dynamic_states.as_ptr(),
     };
-    let layout_ci = vk::PipelineLayoutCreateInfo {
-        s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
+    let pipeline_ci = vk::GraphicsPipelineCreateInfo {
+        s_type: vk::StructureType::GRAPHICS_PIPELINE_CREATE_INFO,
         p_next: ptr::null(),
         flags: Default::default(),
-        set_layout_count: 0,
-        p_set_layouts: ptr::null(),
-        push_constant_range_count: 0,
-        p_push_constant_ranges: ptr::null(),
+        stage_count: 2,
+        p_stages: shader_stages.as_ptr(),
+        p_vertex_input_state: &vertex_input_ci,
+        p_input_assembly_state: &input_assembly_ci,
+        p_tessellation_state: ptr::null(),
+        p_viewport_state: &viewport_state_ci,
+        p_rasterization_state: &rasterizer_ci,
+        p_multisample_state: &multisampling_ci,
+        p_depth_stencil_state: ptr::null(),
+        p_color_blend_state: &blending_ci,
+        p_dynamic_state: &dynamic_state_ci,
+        layout,
+        render_pass,
+        subpass: 0,
+        base_pipeline_handle: vk::Pipeline::null(),
+        base_pipeline_index: -1,
     };
-    let layout = unsafe { device.create_pipeline_layout(&layout_ci, None) }
-        .expect("Failed to create layout");
+    let pipeline = unsafe {
+        device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_ci], None)
+    }
+    .expect("Failed to create graphics pipeline")
+    .pop()
+    .unwrap();
     unsafe {
-        device.destroy_pipeline_layout(layout, None);
         device.destroy_shader_module(vertex_module, None);
         device.destroy_shader_module(fragment_module, None);
     }
+    pipeline
 }
 
 fn create_shader_module(device: &ash::Device, shader_code: &[u8]) -> vk::ShaderModule {
     let create_info = vk::ShaderModuleCreateInfo {
         s_type: vk::StructureType::SHADER_MODULE_CREATE_INFO,
         p_next: ptr::null(),
-        flags: ShaderModuleCreateFlags::default(),
+        flags: vk::ShaderModuleCreateFlags::default(),
         code_size: shader_code.len(),
         p_code: shader_code.as_ptr() as *const u32,
     };
