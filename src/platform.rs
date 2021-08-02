@@ -41,11 +41,13 @@ pub unsafe fn create_surface(
 ) -> Result<vk::SurfaceKHR, vk::Result> {
     #[cfg(target_os = "macos")]
     {
+        use cocoa::appkit::{NSView, NSWindow};
+        use metal::CoreAnimationLayer;
         use std::mem;
         use std::os::raw::c_void;
         use winit::platform::macos::WindowExtMacOS;
 
-        let wnd: cocoa_id = mem::transmute(window.ns_window());
+        let wnd: cocoa::base::id = mem::transmute(window.ns_window());
 
         let layer = CoreAnimationLayer::new();
 
@@ -57,16 +59,16 @@ pub unsafe fn create_surface(
 
         layer.set_contents_scale(view.backingScaleFactor());
         view.setLayer(mem::transmute(layer.as_ref()));
-        view.setWantsLayer(YES);
+        view.setWantsLayer(cocoa::base::YES);
 
         let create_info = vk::MacOSSurfaceCreateInfoMVK {
-            s_type: vk::StructureType::MACOS_SURFACE_CREATE_INFO_M,
+            s_type: vk::StructureType::MACOS_SURFACE_CREATE_INFO_MVK,
             p_next: ptr::null(),
             flags: Default::default(),
             p_view: window.ns_view() as *const c_void,
         };
 
-        let macos_surface_loader = MacOSSurface::new(entry, instance);
+        let macos_surface_loader = ash::extensions::mvk::MacOSSurface::new(entry, instance);
         macos_surface_loader.create_mac_os_surface_mvk(&create_info, None)
     }
     #[cfg(target_os = "windows")]
