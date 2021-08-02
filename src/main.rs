@@ -211,7 +211,7 @@ impl VulkanApp {
             p_wait_dst_stage_mask: wait_mask.as_ptr(),
             command_buffer_count: 1,
             p_command_buffers: &self.command_buffers[image_index as usize],
-            signal_semaphore_count: 1,
+            signal_semaphore_count: signal_sem.len() as u32,
             p_signal_semaphores: signal_sem.as_ptr(),
         };
         let swapchains = [self.swapchain.swapchain];
@@ -422,15 +422,15 @@ fn create_logical_device(
         .copied()
         .collect::<BTreeSet<_>>();
     let mut queue_create_infos = Vec::with_capacity(queue_families_set.len());
-    let queue_priority = 1.0;
+    let queue_priorities = [1.0];
     for queue_index in queue_families_set {
         let queue_create_info = vk::DeviceQueueCreateInfo {
             s_type: vk::StructureType::DEVICE_QUEUE_CREATE_INFO,
             p_next: ptr::null(),
             flags: vk::DeviceQueueCreateFlags::empty(),
             queue_family_index: queue_index,
-            queue_count: 1,
-            p_queue_priorities: &queue_priority,
+            queue_count: queue_priorities.len() as u32,
+            p_queue_priorities: queue_priorities.as_ptr(),
         };
         queue_create_infos.push(queue_create_info);
     }
@@ -613,7 +613,7 @@ fn create_pipeline_layout(device: &ash::Device) -> vk::PipelineLayout {
 }
 
 fn create_render_pass(device: &ash::Device, swapchain: &Swapchain) -> vk::RenderPass {
-    let color_attachment = vk::AttachmentDescription {
+    let color_attachment = [vk::AttachmentDescription {
         flags: Default::default(),
         format: swapchain.image_format,
         samples: vk::SampleCountFlags::TYPE_1,
@@ -623,24 +623,24 @@ fn create_render_pass(device: &ash::Device, swapchain: &Swapchain) -> vk::Render
         stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
         initial_layout: vk::ImageLayout::UNDEFINED,
         final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
-    };
-    let color_attachment_ref = vk::AttachmentReference {
+    }];
+    let color_attachment_ref = [vk::AttachmentReference {
         attachment: 0,
         layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-    };
-    let subpass = vk::SubpassDescription {
+    }];
+    let subpass = [vk::SubpassDescription {
         flags: Default::default(),
         pipeline_bind_point: vk::PipelineBindPoint::GRAPHICS,
         input_attachment_count: 0,
         p_input_attachments: ptr::null(),
-        color_attachment_count: 1,
-        p_color_attachments: &color_attachment_ref,
+        color_attachment_count: color_attachment_ref.len() as u32,
+        p_color_attachments: color_attachment_ref.as_ptr(),
         p_resolve_attachments: ptr::null(),
         p_depth_stencil_attachment: ptr::null(),
         preserve_attachment_count: 0,
         p_preserve_attachments: ptr::null(),
-    };
-    let dependency = vk::SubpassDependency {
+    }];
+    let dependency = [vk::SubpassDependency {
         src_subpass: vk::SUBPASS_EXTERNAL,
         dst_subpass: 0,
         src_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
@@ -648,17 +648,17 @@ fn create_render_pass(device: &ash::Device, swapchain: &Swapchain) -> vk::Render
         src_access_mask: vk::AccessFlags::empty(),
         dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
         dependency_flags: vk::DependencyFlags::empty(),
-    };
+    }];
     let render_pass_ci = vk::RenderPassCreateInfo {
         s_type: vk::StructureType::RENDER_PASS_CREATE_INFO,
         p_next: ptr::null(),
         flags: Default::default(),
-        attachment_count: 1,
-        p_attachments: &color_attachment,
-        subpass_count: 1,
-        p_subpasses: &subpass,
-        dependency_count: 1,
-        p_dependencies: &dependency,
+        attachment_count: color_attachment.len() as u32,
+        p_attachments: color_attachment.as_ptr(),
+        subpass_count: subpass.len() as u32,
+        p_subpasses: subpass.as_ptr(),
+        dependency_count: dependency.len() as u32,
+        p_dependencies: dependency.as_ptr(),
     };
     unsafe { device.create_render_pass(&render_pass_ci, None) }
         .expect("Failed to create render pass")
@@ -675,25 +675,26 @@ fn create_graphics_pipeline(
     let fragment_shader = include_bytes!("../target/shaders/triangle.frag.spv");
     let vertex_module = create_shader_module(device, vertex_shader);
     let fragment_module = create_shader_module(device, fragment_shader);
-    let vertex_stage_ci = vk::PipelineShaderStageCreateInfo {
-        s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: vk::PipelineShaderStageCreateFlags::default(),
-        stage: vk::ShaderStageFlags::VERTEX,
-        module: vertex_module,
-        p_name: main_str.as_ptr(),
-        p_specialization_info: ptr::null(),
-    };
-    let fragment_stage_ci = vk::PipelineShaderStageCreateInfo {
-        s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: vk::PipelineShaderStageCreateFlags::default(),
-        stage: vk::ShaderStageFlags::FRAGMENT,
-        module: fragment_module,
-        p_name: main_str.as_ptr(),
-        p_specialization_info: ptr::null(),
-    };
-    let shader_stages = [vertex_stage_ci, fragment_stage_ci];
+    let shader_stages = [
+        vk::PipelineShaderStageCreateInfo {
+            s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+            p_next: ptr::null(),
+            flags: vk::PipelineShaderStageCreateFlags::default(),
+            stage: vk::ShaderStageFlags::VERTEX,
+            module: vertex_module,
+            p_name: main_str.as_ptr(),
+            p_specialization_info: ptr::null(),
+        },
+        vk::PipelineShaderStageCreateInfo {
+            s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+            p_next: ptr::null(),
+            flags: vk::PipelineShaderStageCreateFlags::default(),
+            stage: vk::ShaderStageFlags::FRAGMENT,
+            module: fragment_module,
+            p_name: main_str.as_ptr(),
+            p_specialization_info: ptr::null(),
+        },
+    ];
     let vertex_input_ci = vk::PipelineVertexInputStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         p_next: ptr::null(),
@@ -710,26 +711,26 @@ fn create_graphics_pipeline(
         topology: vk::PrimitiveTopology::TRIANGLE_LIST,
         primitive_restart_enable: vk::FALSE,
     };
-    let viewport = vk::Viewport {
+    let viewports = [vk::Viewport {
         x: 0.0,
         y: 0.0,
         width: swapchain.extent.width as f32,
         height: swapchain.extent.height as f32,
         min_depth: 0.0,
         max_depth: 1.0,
-    };
-    let scissor = vk::Rect2D {
+    }];
+    let scissors = [vk::Rect2D {
         offset: vk::Offset2D { x: 0, y: 0 },
         extent: swapchain.extent,
-    };
+    }];
     let viewport_state_ci = vk::PipelineViewportStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_VIEWPORT_STATE_CREATE_INFO,
         p_next: ptr::null(),
         flags: Default::default(),
-        viewport_count: 1,
-        p_viewports: &viewport,
-        scissor_count: 1,
-        p_scissors: &scissor,
+        viewport_count: viewports.len() as u32,
+        p_viewports: viewports.as_ptr(),
+        scissor_count: scissors.len() as u32,
+        p_scissors: scissors.as_ptr(),
     };
     let rasterizer_ci = vk::PipelineRasterizationStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
@@ -757,7 +758,7 @@ fn create_graphics_pipeline(
         alpha_to_coverage_enable: vk::FALSE,
         alpha_to_one_enable: vk::FALSE,
     };
-    let blending_settings = vk::PipelineColorBlendAttachmentState {
+    let blending_settings = [vk::PipelineColorBlendAttachmentState {
         blend_enable: vk::FALSE,
         src_color_blend_factor: vk::BlendFactor::ONE,
         dst_color_blend_factor: vk::BlendFactor::ZERO,
@@ -766,22 +767,22 @@ fn create_graphics_pipeline(
         dst_alpha_blend_factor: vk::BlendFactor::ZERO,
         alpha_blend_op: vk::BlendOp::ADD,
         color_write_mask: vk::ColorComponentFlags::all(),
-    };
+    }];
     let blending_ci = vk::PipelineColorBlendStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
         p_next: ptr::null(),
         flags: Default::default(),
         logic_op_enable: vk::FALSE,
         logic_op: vk::LogicOp::COPY,
-        attachment_count: 1,
-        p_attachments: &blending_settings,
+        attachment_count: blending_settings.len() as u32,
+        p_attachments: blending_settings.as_ptr(),
         blend_constants: [0.0; 4],
     };
     let pipeline_ci = vk::GraphicsPipelineCreateInfo {
         s_type: vk::StructureType::GRAPHICS_PIPELINE_CREATE_INFO,
         p_next: ptr::null(),
         flags: Default::default(),
-        stage_count: 2,
+        stage_count: shader_stages.len() as u32,
         p_stages: shader_stages.as_ptr(),
         p_vertex_input_state: &vertex_input_ci,
         p_input_assembly_state: &input_assembly_ci,
@@ -837,7 +838,7 @@ fn create_framebuffers(
             p_next: ptr::null(),
             flags: Default::default(),
             render_pass,
-            attachment_count: 1,
+            attachment_count: attachments.len() as u32,
             p_attachments: attachments.as_ptr(),
             width: swapchain.extent.width,
             height: swapchain.extent.height,
@@ -889,7 +890,7 @@ fn create_command_buffers(
             flags: Default::default(),
             p_inheritance_info: ptr::null(),
         };
-        let clear_value = vk::ClearValue::default();
+        let clear_value = [vk::ClearValue::default()];
         let rp_begin = vk::RenderPassBeginInfo {
             s_type: vk::StructureType::RENDER_PASS_BEGIN_INFO,
             p_next: ptr::null(),
@@ -899,8 +900,8 @@ fn create_command_buffers(
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent: swapchain.extent,
             },
-            clear_value_count: 1,
-            p_clear_values: &clear_value,
+            clear_value_count: clear_value.len() as u32,
+            p_clear_values: clear_value.as_ptr(),
         };
         unsafe {
             device
