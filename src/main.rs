@@ -716,7 +716,7 @@ fn create_graphics_pipeline(
         width: swapchain.extent.width as f32,
         height: swapchain.extent.height as f32,
         min_depth: 0.0,
-        max_depth: 0.0,
+        max_depth: 1.0,
     };
     let scissor = vk::Rect2D {
         offset: vk::Offset2D { x: 0, y: 0 },
@@ -736,7 +736,7 @@ fn create_graphics_pipeline(
         p_next: ptr::null(),
         flags: Default::default(),
         depth_clamp_enable: vk::FALSE,
-        rasterizer_discard_enable: vk::TRUE,
+        rasterizer_discard_enable: vk::FALSE,
         polygon_mode: vk::PolygonMode::FILL,
         cull_mode: vk::CullModeFlags::BACK,
         front_face: vk::FrontFace::CLOCKWISE,
@@ -777,14 +777,6 @@ fn create_graphics_pipeline(
         p_attachments: &blending_settings,
         blend_constants: [0.0; 4],
     };
-    let dynamic_states = vec![vk::DynamicState::VIEWPORT, vk::DynamicState::LINE_WIDTH];
-    let dynamic_state_ci = vk::PipelineDynamicStateCreateInfo {
-        s_type: vk::StructureType::PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: Default::default(),
-        dynamic_state_count: 2,
-        p_dynamic_states: dynamic_states.as_ptr(),
-    };
     let pipeline_ci = vk::GraphicsPipelineCreateInfo {
         s_type: vk::StructureType::GRAPHICS_PIPELINE_CREATE_INFO,
         p_next: ptr::null(),
@@ -799,7 +791,7 @@ fn create_graphics_pipeline(
         p_multisample_state: &multisampling_ci,
         p_depth_stencil_state: ptr::null(),
         p_color_blend_state: &blending_ci,
-        p_dynamic_state: &dynamic_state_ci,
+        p_dynamic_state: ptr::null(),
         layout,
         render_pass,
         subpass: 0,
