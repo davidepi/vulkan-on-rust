@@ -210,6 +210,7 @@ struct VulkanApp {
     acquire_inflight: [vk::Fence; MAX_FRAMES_IN_FLIGHT],
     images_inflight: [vk::Fence; MAX_FRAMES_IN_FLIGHT],
     vertex_buffer: vk::Buffer,
+    vb_memory: vk::DeviceMemory,
     inflight_frame_no: usize,
     resized: bool,
 }
@@ -244,6 +245,8 @@ impl VulkanApp {
         let sem_img_available = create_semaphore(&device);
         let sem_render_finish = create_semaphore(&device);
         let acquire_inflight = create_fence(&device);
+        let (vertex_buffer, vb_memory) =
+            allocate_vertex_buffer(&instance, physical_device.device, &device, &TRIANGLE);
         let command_buffers = create_command_buffers(
             &device,
             command_pool,
@@ -251,8 +254,9 @@ impl VulkanApp {
             render_pass,
             &swapchain,
             pipeline,
+            vertex_buffer,
+            TRIANGLE.len(),
         );
-        let vertex_buffer = create_vertex_buffer(&device);
         VulkanApp {
             _entry: entry,
             instance,
@@ -275,6 +279,7 @@ impl VulkanApp {
             acquire_inflight,
             images_inflight: [vk::Fence::null(); MAX_FRAMES_IN_FLIGHT],
             vertex_buffer,
+            vb_memory,
             inflight_frame_no: 0,
             resized: false,
         }
@@ -436,6 +441,8 @@ impl VulkanApp {
             render_pass,
             &swapchain,
             pipeline,
+            self.vertex_buffer,
+            TRIANGLE.len(),
         );
         self.swapchain = swapchain;
         self.image_views = image_views;
@@ -468,6 +475,7 @@ impl VulkanApp {
 impl Drop for VulkanApp {
     fn drop(&mut self) {
         unsafe {
+            self.device.free_memory(self.vb_memory, None);
             self.device.destroy_buffer(self.vertex_buffer, None);
             for i in 0..MAX_FRAMES_IN_FLIGHT {
                 self.device
@@ -1074,6 +1082,8 @@ fn create_command_buffers(
     render_pass: vk::RenderPass,
     swapchain: &Swapchain,
     pipeline: vk::Pipeline,
+    vb: vk::Buffer,
+    vb_len: usize,
 ) -> Vec<vk::CommandBuffer> {
     let alloc_ci = vk::CommandBufferAllocateInfo {
         s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
@@ -1112,7 +1122,8 @@ fn create_command_buffers(
                 .expect("Failed to begin command buffer");
             device.cmd_begin_render_pass(command_buffer, &rp_begin, vk::SubpassContents::INLINE);
             device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            device.cmd_draw(command_buffer, 3, 1, 0, 0);
+            device.cmd_bind_vertex_buffers(command_buffer, 0, &[vb], &[0]);
+            device.cmd_draw(command_buffer, vb_len as u32, 1, 0, 0);
             device.cmd_end_render_pass(command_buffer);
             device
                 .end_command_buffer(command_buffer)
@@ -1150,18 +1161,72 @@ fn create_fence(device: &ash::Device) -> [vk::Fence; MAX_FRAMES_IN_FLIGHT] {
     retval
 }
 
-fn create_vertex_buffer(device: &ash::Device) -> vk::Buffer {
+fn allocate_vertex_buffer(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    device: &ash::Device,
+    data: &[Vertex],
+) -> (vk::Buffer, vk::DeviceMemory) {
     let vb_ci = vk::BufferCreateInfo {
         s_type: vk::StructureType::BUFFER_CREATE_INFO,
         p_next: ptr::null(),
         flags: Default::default(),
-        size: (std::mem::size_of::<Vertex>() * TRIANGLE.len()) as u64,
+        size: (std::mem::size_of::<Vertex>() * data.len()) as u64,
         usage: vk::BufferUsageFlags::VERTEX_BUFFER,
         sharing_mode: vk::SharingMode::EXCLUSIVE,
         queue_family_index_count: 0,
         p_queue_family_indices: ptr::null(),
     };
-    unsafe { device.create_buffer(&vb_ci, None) }.expect("Failed to create vertex buffer")
+    let buffer =
+        unsafe { device.create_buffer(&vb_ci, None) }.expect("Failed to create vertex buffer");
+    let mem_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+    // reminder to future myself:
+    // for faster performance disable COHERENT and flush manually
+    let required_properties =
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    let mem_alloc_ci = vk::MemoryAllocateInfo {
+        s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
+        p_next: ptr::null(),
+        allocation_size: mem_requirements.size,
+        memory_type_index: find_memory_type(
+            instance,
+            physical_device,
+            mem_requirements.memory_type_bits,
+            required_properties,
+        ),
+    };
+    let device_memory =
+        unsafe { device.allocate_memory(&mem_alloc_ci, None) }.expect("Failed to allocate memory");
+    unsafe {
+        device
+            .bind_buffer_memory(buffer, device_memory, 0)
+            .expect("Failed to bind buffer and device memory");
+        let mapped = device
+            .map_memory(device_memory, 0, vb_ci.size, Default::default())
+            .expect("Failed to map memory") as *mut Vertex;
+        mapped.copy_from_nonoverlapping(data.as_ptr(), data.len());
+        device.unmap_memory(device_memory);
+    }
+    (buffer, device_memory)
+}
+
+fn find_memory_type(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    suitable_types: u32,
+    suitable_properties: vk::MemoryPropertyFlags,
+) -> u32 {
+    let mem_properties = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    for i in 0..mem_properties.memory_type_count {
+        let is_suitable_type = ((1 << i) & suitable_types) != 0;
+        let has_suitable_properties = mem_properties.memory_types[i as usize].property_flags
+            & suitable_properties
+            == suitable_properties;
+        if is_suitable_type && has_suitable_properties {
+            return i;
+        }
+    }
+    panic!("Failed to find suitable memory")
 }
 
 fn main() {
