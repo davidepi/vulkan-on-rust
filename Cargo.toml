@@ -13,6 +13,8 @@ shaderc = "0.7.2"
 ash = "0.32.1"
 winit = "0.25.0"
 log = "0.4"
+cgmath = "0.18.0"
+memoffset = "0.6.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.17.0"

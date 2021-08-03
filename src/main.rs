@@ -1,5 +1,7 @@
 use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
 use ash::vk;
+use cgmath::Vector3 as Vec3;
+use memoffset::offset_of;
 use platform::create_surface;
 use std::collections::{BTreeSet, HashSet};
 use std::ffi::{CStr, CString};
@@ -20,6 +22,45 @@ const REQUIRED_VALIDATIONS: [&str; 1] = ["VK_LAYER_KHRONOS_validation"];
 fn device_required_features() -> Vec<&'static CStr> {
     vec![ash::extensions::khr::Swapchain::name()]
 }
+
+const TRIANGLE: [Vertex; 3] = [
+    Vertex {
+        position: Vec3 {
+            x: 0.0,
+            y: -0.5,
+            z: 0.0,
+        },
+        color: Vec3 {
+            x: 1.0,
+            y: 0.0,
+            z: 0.0,
+        },
+    },
+    Vertex {
+        position: Vec3 {
+            x: 0.5,
+            y: 0.5,
+            z: 0.0,
+        },
+        color: Vec3 {
+            x: 0.0,
+            y: 1.0,
+            z: 0.0,
+        },
+    },
+    Vertex {
+        position: Vec3 {
+            x: -0.5,
+            y: 0.5,
+            z: 0.0,
+        },
+        color: Vec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 1.0,
+        },
+    },
+];
 
 struct SwapchainSupport {
     capabilities: vk::SurfaceCapabilitiesKHR,
@@ -113,6 +154,39 @@ impl Swapchain {
     }
 }
 
+#[repr(C)]
+struct Vertex {
+    position: Vec3<f32>,
+    color: Vec3<f32>,
+}
+
+impl Vertex {
+    fn binding_descriptions() -> [vk::VertexInputBindingDescription; 1] {
+        [vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: std::mem::size_of::<Vertex>() as u32,
+            input_rate: vk::VertexInputRate::VERTEX,
+        }]
+    }
+
+    fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
+        [
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: offset_of!(Vertex, position) as u32,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: offset_of!(Vertex, color) as u32,
+            },
+        ]
+    }
+}
+
 struct VulkanApp {
     instance: ash::Instance,
     device: ash::Device,
@@ -133,6 +207,7 @@ struct VulkanApp {
     sem_render_finish: [vk::Semaphore; MAX_FRAMES_IN_FLIGHT],
     acquire_inflight: [vk::Fence; MAX_FRAMES_IN_FLIGHT],
     images_inflight: [vk::Fence; MAX_FRAMES_IN_FLIGHT],
+    vertex_buffer: vk::Buffer,
     inflight_frame_no: usize,
     resized: bool,
 }
@@ -175,6 +250,7 @@ impl VulkanApp {
             &swapchain,
             pipeline,
         );
+        let vertex_buffer = create_vertex_buffer(&device);
         VulkanApp {
             instance,
             device,
@@ -195,6 +271,7 @@ impl VulkanApp {
             sem_render_finish,
             acquire_inflight,
             images_inflight: [vk::Fence::null(); MAX_FRAMES_IN_FLIGHT],
+            vertex_buffer,
             inflight_frame_no: 0,
             resized: false,
         }
@@ -388,6 +465,7 @@ impl VulkanApp {
 impl Drop for VulkanApp {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_buffer(self.vertex_buffer, None);
             for i in 0..MAX_FRAMES_IN_FLIGHT {
                 self.device
                     .destroy_semaphore(self.sem_render_finish[i], None);
@@ -815,14 +893,16 @@ fn create_graphics_pipeline(
             p_specialization_info: ptr::null(),
         },
     ];
+    let binding_descriptions = Vertex::binding_descriptions();
+    let attribute_descriptions = Vertex::attribute_descriptions();
     let vertex_input_ci = vk::PipelineVertexInputStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         p_next: ptr::null(),
         flags: Default::default(),
-        vertex_binding_description_count: 0,
-        p_vertex_binding_descriptions: ptr::null(),
-        vertex_attribute_description_count: 0,
-        p_vertex_attribute_descriptions: ptr::null(),
+        vertex_binding_description_count: binding_descriptions.len() as u32,
+        p_vertex_binding_descriptions: binding_descriptions.as_ptr(),
+        vertex_attribute_description_count: attribute_descriptions.len() as u32,
+        p_vertex_attribute_descriptions: attribute_descriptions.as_ptr(),
     };
     let input_assembly_ci = vk::PipelineInputAssemblyStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
@@ -1065,6 +1145,20 @@ fn create_fence(device: &ash::Device) -> [vk::Fence; MAX_FRAMES_IN_FLIGHT] {
             unsafe { device.create_fence(&fence_ci, None) }.expect("Failed to create semaphore");
     }
     retval
+}
+
+fn create_vertex_buffer(device: &ash::Device) -> vk::Buffer {
+    let vb_ci = vk::BufferCreateInfo {
+        s_type: vk::StructureType::BUFFER_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: Default::default(),
+        size: (std::mem::size_of::<Vertex>() * TRIANGLE.len()) as u64,
+        usage: vk::BufferUsageFlags::VERTEX_BUFFER,
+        sharing_mode: vk::SharingMode::EXCLUSIVE,
+        queue_family_index_count: 0,
+        p_queue_family_indices: ptr::null(),
+    };
+    unsafe { device.create_buffer(&vb_ci, None) }.expect("Failed to create vertex buffer")
 }
 
 fn main() {
