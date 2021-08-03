@@ -27,9 +27,8 @@ struct SwapchainSupport {
     present_modes: Vec<vk::PresentModeKHR>,
 }
 
-struct DeviceWithCapabilities {
+struct PDeviceAndQueues {
     device: vk::PhysicalDevice,
-    swapchain: SwapchainSupport,
     queue_family: QueueFamilyIndices,
 }
 
@@ -117,6 +116,7 @@ impl Swapchain {
 struct VulkanApp {
     instance: ash::Instance,
     device: ash::Device,
+    physical_device: PDeviceAndQueues,
     graphics_queue: vk::Queue,
     present_queue: vk::Queue,
     window: Window,
@@ -134,6 +134,7 @@ struct VulkanApp {
     acquire_inflight: [vk::Fence; MAX_FRAMES_IN_FLIGHT],
     images_inflight: [vk::Fence; MAX_FRAMES_IN_FLIGHT],
     inflight_frame_no: usize,
+    resized: bool,
 }
 
 impl VulkanApp {
@@ -143,11 +144,18 @@ impl VulkanApp {
         let instance = create_instance(&entry, &validations);
         let surface = Surface::new(&entry, &instance, &window);
         let physical_device = pick_physical_device(&instance, &surface);
+        let swapchain_support = query_swapchain_capabilities(&surface, physical_device.device);
         let (device, queue_indices) =
             create_logical_device(&instance, &physical_device, &validations);
         let graphics_queue = unsafe { device.get_device_queue(queue_indices.graphics_family, 0) };
         let present_queue = unsafe { device.get_device_queue(queue_indices.present_family, 0) };
-        let swapchain = create_swapchain(&instance, &device, &physical_device, &surface);
+        let swapchain = create_swapchain(
+            &instance,
+            &device,
+            &swapchain_support,
+            &physical_device.queue_family,
+            &surface,
+        );
         let images = unsafe { swapchain.loader.get_swapchain_images(swapchain.swapchain) }
             .expect("Failed to get images");
         let image_views = create_image_views(&device, &swapchain, &images);
@@ -170,6 +178,7 @@ impl VulkanApp {
         VulkanApp {
             instance,
             device,
+            physical_device,
             graphics_queue,
             present_queue,
             window,
@@ -187,6 +196,7 @@ impl VulkanApp {
             acquire_inflight,
             images_inflight: [vk::Fence::null(); MAX_FRAMES_IN_FLIGHT],
             inflight_frame_no: 0,
+            resized: false,
         }
     }
 
@@ -208,15 +218,24 @@ impl VulkanApp {
                 )
                 .expect("Failed to wait for fence");
         }
-        let (image_index, _) = unsafe {
+        let image_index;
+        let acquire_result = unsafe {
             self.swapchain.loader.acquire_next_image(
                 self.swapchain.swapchain,
                 u64::MAX,
                 self.sem_img_available[self.inflight_frame_no],
                 vk::Fence::null(),
             )
+        };
+        if acquire_result == Err(vk::Result::ERROR_OUT_OF_DATE_KHR) || self.resized {
+            self.recreate_swapchain();
+            self.resized = false;
+            return;
+        } else if acquire_result.is_err() {
+            panic!("Failed to acquire image");
+        } else {
+            image_index = acquire_result.unwrap().0;
         }
-        .expect("Failed to acquire next image");
         if self.images_inflight[self.inflight_frame_no] != vk::Fence::null() {
             // this frame is currently in use, wait for it
             unsafe {
@@ -266,10 +285,20 @@ impl VulkanApp {
                     self.acquire_inflight[self.inflight_frame_no],
                 )
                 .expect("Failed to submit graphicsqueue");
-            self.swapchain
+            let present_res = self
+                .swapchain
                 .loader
-                .queue_present(self.present_queue, &present_ci)
-                .expect("Failed to submit present queue");
+                .queue_present(self.present_queue, &present_ci);
+            if present_res == Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
+                || present_res == Err(vk::Result::SUBOPTIMAL_KHR)
+                || self.resized
+            {
+                self.recreate_swapchain();
+                self.resized = false;
+                return;
+            } else if present_res.is_err() {
+                panic!("Failed to present queue")
+            }
             self.device
                 .queue_wait_idle(self.present_queue)
                 .expect("Failed to wait for the queue");
@@ -280,9 +309,13 @@ impl VulkanApp {
     pub fn main_loop(mut self, event_loop: EventLoop<()>) -> ! {
         event_loop.run(move |event, _, control_flow| match event {
             Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
+                event,
                 window_id: _,
-            } => *control_flow = ControlFlow::Exit,
+            } => match event {
+                WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+                WindowEvent::Resized(_) => self.resized = true,
+                _ => {}
+            },
             Event::MainEventsCleared => self.window.request_redraw(),
             Event::RedrawRequested(_) => self.draw_frame(),
             Event::LoopDestroyed => {
@@ -290,6 +323,65 @@ impl VulkanApp {
             }
             _ => (),
         })
+    }
+
+    fn recreate_swapchain(&mut self) {
+        unsafe {
+            self.device
+                .device_wait_idle()
+                .expect("Failed to wait on device");
+        }
+        self.destroy_swapchain();
+        let swapchain_supp =
+            query_swapchain_capabilities(&self.surface, self.physical_device.device);
+        let swapchain = create_swapchain(
+            &self.instance,
+            &self.device,
+            &swapchain_supp,
+            &self.physical_device.queue_family,
+            &self.surface,
+        );
+        let images = unsafe { swapchain.loader.get_swapchain_images(swapchain.swapchain) }
+            .expect("Failed to get images");
+        let image_views = create_image_views(&self.device, &swapchain, &images);
+        let render_pass = create_render_pass(&self.device, &swapchain);
+        let pipeline_layout = create_pipeline_layout(&self.device);
+        let pipeline =
+            create_graphics_pipeline(&self.device, &swapchain, render_pass, pipeline_layout);
+        let framebuffers = create_framebuffers(&self.device, &swapchain, &image_views, render_pass);
+        let command_buffers = create_command_buffers(
+            &self.device,
+            self.command_pool,
+            &framebuffers,
+            render_pass,
+            &swapchain,
+            pipeline,
+        );
+        self.swapchain = swapchain;
+        self.image_views = image_views;
+        self.render_pass = render_pass;
+        self.pipeline_layout = pipeline_layout;
+        self.pipeline = pipeline;
+        self.framebuffers = framebuffers;
+        self.command_buffers = command_buffers;
+    }
+
+    fn destroy_swapchain(&self) {
+        unsafe {
+            self.device
+                .free_command_buffers(self.command_pool, &self.command_buffers);
+            self.framebuffers
+                .iter()
+                .for_each(|fb| self.device.destroy_framebuffer(*fb, None));
+            self.device.destroy_pipeline(self.pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device.destroy_render_pass(self.render_pass, None);
+            self.image_views
+                .iter()
+                .for_each(|iv| self.device.destroy_image_view(*iv, None));
+            self.swapchain.destroy();
+        }
     }
 }
 
@@ -304,17 +396,7 @@ impl Drop for VulkanApp {
                 self.device.destroy_fence(self.acquire_inflight[i], None);
             }
             self.device.destroy_command_pool(self.command_pool, None);
-            self.framebuffers
-                .iter()
-                .for_each(|fb| self.device.destroy_framebuffer(*fb, None));
-            self.device.destroy_pipeline(self.pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
-            self.device.destroy_render_pass(self.render_pass, None);
-            self.image_views
-                .iter()
-                .for_each(|iv| self.device.destroy_image_view(*iv, None));
-            self.swapchain.destroy();
+            self.destroy_swapchain();
             self.surface.destroy();
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
@@ -364,7 +446,7 @@ fn create_instance(entry: &ash::Entry, validations: &ValidationsRequested) -> as
     }
 }
 
-fn pick_physical_device(instance: &ash::Instance, surface: &Surface) -> DeviceWithCapabilities {
+fn pick_physical_device(instance: &ash::Instance, surface: &Surface) -> PDeviceAndQueues {
     let physical_devices =
         unsafe { instance.enumerate_physical_devices() }.expect("No physical devices found");
     log::info!("Found {} GPUs in the system", physical_devices.len());
@@ -381,7 +463,7 @@ fn rate_physical_device_suitability(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     surface: &Surface,
-) -> Option<(u32, DeviceWithCapabilities)> {
+) -> Option<(u32, PDeviceAndQueues)> {
     let device_properties = unsafe { instance.get_physical_device_properties(physical_device) };
     // let device_features = unsafe { instance.get_physical_device_features(physical_device) };
     let score = match device_properties.device_type {
@@ -398,9 +480,8 @@ fn rate_physical_device_suitability(
             if !swapchain.formats.is_empty() && !swapchain.present_modes.is_empty() {
                 Some((
                     score,
-                    DeviceWithCapabilities {
+                    PDeviceAndQueues {
                         device: physical_device,
-                        swapchain,
                         queue_family,
                     },
                 ))
@@ -454,7 +535,7 @@ fn find_queue_families(
 
 fn create_logical_device(
     instance: &ash::Instance,
-    device: &DeviceWithCapabilities,
+    device: &PDeviceAndQueues,
     validations: &ValidationsRequested,
 ) -> (ash::Device, QueueFamilyIndices) {
     let physical_device = device.device;
@@ -532,22 +613,21 @@ fn query_swapchain_capabilities(
 
 fn create_swapchain(
     instance: &ash::Instance,
-    ldevice: &ash::Device,
-    device: &DeviceWithCapabilities,
+    device: &ash::Device,
+    swapchain: &SwapchainSupport,
+    queue_family: &QueueFamilyIndices,
     surface: &Surface,
 ) -> Swapchain {
-    let capabilities = &device.swapchain.capabilities;
-    let format = *device
-        .swapchain
+    let capabilities = &swapchain.capabilities;
+    let format = swapchain
         .formats
         .iter()
         .find(|sf| {
             sf.format == vk::Format::B8G8R8A8_SRGB
                 && sf.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
         })
-        .unwrap_or_else(|| device.swapchain.formats.first().unwrap());
-    let present_mode = *device
-        .swapchain
+        .unwrap_or_else(|| swapchain.formats.first().unwrap());
+    let present_mode = *swapchain
         .present_modes
         .iter()
         .find(|&x| *x == vk::PresentModeKHR::MAILBOX)
@@ -573,12 +653,9 @@ fn create_swapchain(
             .max_image_count
             .max(capabilities.min_image_count + 1)
     };
-    let queue_families_indices = [
-        device.queue_family.graphics_family,
-        device.queue_family.present_family,
-    ];
+    let queue_families_indices = [queue_family.graphics_family, queue_family.present_family];
     let (image_sharing_mode, queue_family_index_count, p_queue_family_indices) =
-        if device.queue_family.graphics_family != device.queue_family.present_family {
+        if queue_family.graphics_family != queue_family.present_family {
             (
                 vk::SharingMode::CONCURRENT,
                 2,
@@ -607,7 +684,7 @@ fn create_swapchain(
         clipped: vk::TRUE,
         old_swapchain: vk::SwapchainKHR::null(),
     };
-    Swapchain::new(instance, ldevice, &create_info)
+    Swapchain::new(instance, device, &create_info)
 }
 
 fn create_image_views(
@@ -896,7 +973,7 @@ fn create_framebuffers(
 
 fn create_command_pool(
     device: &ash::Device,
-    physical_device: &DeviceWithCapabilities,
+    physical_device: &PDeviceAndQueues,
 ) -> vk::CommandPool {
     let pool_ci = vk::CommandPoolCreateInfo {
         s_type: vk::StructureType::COMMAND_POOL_CREATE_INFO,
@@ -963,14 +1040,14 @@ fn create_command_buffers(
 }
 
 fn create_semaphore(device: &ash::Device) -> [vk::Semaphore; MAX_FRAMES_IN_FLIGHT] {
-    let mut retval = [vk::Semaphore::null(); 2];
-    for i in 0..MAX_FRAMES_IN_FLIGHT {
+    let mut retval = [vk::Semaphore::null(); MAX_FRAMES_IN_FLIGHT];
+    for semaphore in retval.iter_mut() {
         let semaphore_ci = vk::SemaphoreCreateInfo {
             s_type: vk::StructureType::SEMAPHORE_CREATE_INFO,
             p_next: ptr::null(),
             flags: Default::default(),
         };
-        retval[i] = unsafe { device.create_semaphore(&semaphore_ci, None) }
+        *semaphore = unsafe { device.create_semaphore(&semaphore_ci, None) }
             .expect("Failed to create semaphore");
     }
     retval
@@ -978,13 +1055,13 @@ fn create_semaphore(device: &ash::Device) -> [vk::Semaphore; MAX_FRAMES_IN_FLIGH
 
 fn create_fence(device: &ash::Device) -> [vk::Fence; MAX_FRAMES_IN_FLIGHT] {
     let mut retval = [vk::Fence::null(); MAX_FRAMES_IN_FLIGHT];
-    for i in 0..MAX_FRAMES_IN_FLIGHT {
+    for fence in retval.iter_mut() {
         let fence_ci = vk::FenceCreateInfo {
             s_type: vk::StructureType::FENCE_CREATE_INFO,
             p_next: ptr::null(),
             flags: vk::FenceCreateFlags::SIGNALED,
         };
-        retval[i] =
+        *fence =
             unsafe { device.create_fence(&fence_ci, None) }.expect("Failed to create semaphore");
     }
     retval
