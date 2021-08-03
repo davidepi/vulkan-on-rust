@@ -188,6 +188,8 @@ impl Vertex {
 }
 
 struct VulkanApp {
+    // dropping an Entry causes every call that uses Surface to SEGFAULT on linux
+    _entry: ash::Entry,
     instance: ash::Instance,
     device: ash::Device,
     physical_device: PDeviceAndQueues,
@@ -252,6 +254,7 @@ impl VulkanApp {
         );
         let vertex_buffer = create_vertex_buffer(&device);
         VulkanApp {
+            _entry: entry,
             instance,
             device,
             physical_device,
@@ -304,7 +307,7 @@ impl VulkanApp {
                 vk::Fence::null(),
             )
         };
-        if acquire_result == Err(vk::Result::ERROR_OUT_OF_DATE_KHR) || self.resized {
+        if acquire_result == Err(vk::Result::ERROR_OUT_OF_DATE_KHR) {
             self.recreate_swapchain();
             self.resized = false;
             return;
@@ -473,8 +476,8 @@ impl Drop for VulkanApp {
                     .destroy_semaphore(self.sem_img_available[i], None);
                 self.device.destroy_fence(self.acquire_inflight[i], None);
             }
-            self.device.destroy_command_pool(self.command_pool, None);
             self.destroy_swapchain();
+            self.device.destroy_command_pool(self.command_pool, None);
             self.surface.destroy();
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
