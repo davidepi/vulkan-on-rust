@@ -23,10 +23,10 @@ fn device_required_features() -> Vec<&'static CStr> {
     vec![ash::extensions::khr::Swapchain::name()]
 }
 
-const TRIANGLE: [Vertex; 3] = [
+const VERTICES: [Vertex; 4] = [
     Vertex {
         position: Vec3 {
-            x: 0.0,
+            x: -0.5,
             y: -0.5,
             z: 0.0,
         },
@@ -39,7 +39,7 @@ const TRIANGLE: [Vertex; 3] = [
     Vertex {
         position: Vec3 {
             x: 0.5,
-            y: 0.5,
+            y: -0.5,
             z: 0.0,
         },
         color: Vec3 {
@@ -50,7 +50,7 @@ const TRIANGLE: [Vertex; 3] = [
     },
     Vertex {
         position: Vec3 {
-            x: -0.5,
+            x: 0.5,
             y: 0.5,
             z: 0.0,
         },
@@ -60,7 +60,21 @@ const TRIANGLE: [Vertex; 3] = [
             z: 1.0,
         },
     },
+    Vertex {
+        position: Vec3 {
+            x: -0.5,
+            y: 0.5,
+            z: 0.0,
+        },
+        color: Vec3 {
+            x: 1.0,
+            y: 1.0,
+            z: 1.0,
+        },
+    },
 ];
+
+const INDICES: [u32; 6] = [0, 1, 2, 2, 3, 0];
 
 struct SwapchainSupport {
     capabilities: vk::SurfaceCapabilitiesKHR,
@@ -154,13 +168,29 @@ impl Swapchain {
     }
 }
 
-#[repr(C)]
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
 struct Vertex {
     position: Vec3<f32>,
     color: Vec3<f32>,
 }
 
 impl Vertex {
+    fn new(values: [f32; 6]) -> Vertex {
+        Vertex {
+            position: Vec3 {
+                x: values[0],
+                y: values[1],
+                z: values[2],
+            },
+            color: Vec3 {
+                x: values[3],
+                y: values[4],
+                z: values[5],
+            },
+        }
+    }
+
     fn binding_descriptions() -> [vk::VertexInputBindingDescription; 1] {
         [vk::VertexInputBindingDescription {
             binding: 0,
@@ -187,6 +217,15 @@ impl Vertex {
     }
 }
 
+struct DrawData {
+    vertex_buffer: vk::Buffer,
+    vb_memory: vk::DeviceMemory,
+    index_buffer: vk::Buffer,
+    ib_memory: vk::DeviceMemory,
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
+}
+
 struct VulkanApp {
     // dropping an Entry causes every call that uses Surface to SEGFAULT on linux
     _entry: ash::Entry,
@@ -209,8 +248,7 @@ struct VulkanApp {
     sem_render_finish: [vk::Semaphore; MAX_FRAMES_IN_FLIGHT],
     acquire_inflight: [vk::Fence; MAX_FRAMES_IN_FLIGHT],
     images_inflight: [vk::Fence; MAX_FRAMES_IN_FLIGHT],
-    vertex_buffer: vk::Buffer,
-    vb_memory: vk::DeviceMemory,
+    draw_data: DrawData,
     inflight_frame_no: usize,
     resized: bool,
 }
@@ -245,23 +283,40 @@ impl VulkanApp {
         let sem_img_available = create_semaphore(&device);
         let sem_render_finish = create_semaphore(&device);
         let acquire_inflight = create_fence(&device);
-        let (vertex_buffer, vb_memory) = create_vertex_buffer(
+        let (vertex_buffer, vb_memory) = allocate_buffer(
             &instance,
             physical_device.device,
             &device,
             command_pool,
             graphics_queue,
-            &TRIANGLE,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            &VERTICES,
         );
-        let command_buffers = create_command_buffers(
+        let (index_buffer, ib_memory) = allocate_buffer(
+            &instance,
+            physical_device.device,
+            &device,
+            command_pool,
+            graphics_queue,
+            vk::BufferUsageFlags::INDEX_BUFFER,
+            &INDICES,
+        );
+        let draw_data = DrawData {
+            vertex_buffer,
+            vb_memory,
+            index_buffer,
+            ib_memory,
+            vertices: VERTICES.to_vec(),
+            indices: INDICES.to_vec(),
+        };
+        let commands = create_command_buffers(
             &device,
             command_pool,
             &framebuffers,
             render_pass,
             &swapchain,
             pipeline,
-            vertex_buffer,
-            TRIANGLE.len(),
+            &draw_data,
         );
         VulkanApp {
             _entry: entry,
@@ -279,13 +334,12 @@ impl VulkanApp {
             pipeline,
             framebuffers,
             command_pool,
-            command_buffers,
+            command_buffers: commands,
             sem_img_available,
             sem_render_finish,
             acquire_inflight,
             images_inflight: [vk::Fence::null(); MAX_FRAMES_IN_FLIGHT],
-            vertex_buffer,
-            vb_memory,
+            draw_data,
             inflight_frame_no: 0,
             resized: false,
         }
@@ -447,8 +501,7 @@ impl VulkanApp {
             render_pass,
             &swapchain,
             pipeline,
-            self.vertex_buffer,
-            TRIANGLE.len(),
+            &self.draw_data,
         );
         self.swapchain = swapchain;
         self.image_views = image_views;
@@ -481,8 +534,12 @@ impl VulkanApp {
 impl Drop for VulkanApp {
     fn drop(&mut self) {
         unsafe {
-            self.device.free_memory(self.vb_memory, None);
-            self.device.destroy_buffer(self.vertex_buffer, None);
+            self.device.free_memory(self.draw_data.ib_memory, None);
+            self.device
+                .destroy_buffer(self.draw_data.index_buffer, None);
+            self.device.free_memory(self.draw_data.vb_memory, None);
+            self.device
+                .destroy_buffer(self.draw_data.vertex_buffer, None);
             for i in 0..MAX_FRAMES_IN_FLIGHT {
                 self.device
                     .destroy_semaphore(self.sem_render_finish[i], None);
@@ -1088,8 +1145,7 @@ fn create_command_buffers(
     render_pass: vk::RenderPass,
     swapchain: &Swapchain,
     pipeline: vk::Pipeline,
-    vb: vk::Buffer,
-    vb_len: usize,
+    data: &DrawData,
 ) -> Vec<vk::CommandBuffer> {
     let alloc_ci = vk::CommandBufferAllocateInfo {
         s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
@@ -1128,8 +1184,14 @@ fn create_command_buffers(
                 .expect("Failed to begin command buffer");
             device.cmd_begin_render_pass(command_buffer, &rp_begin, vk::SubpassContents::INLINE);
             device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            device.cmd_bind_vertex_buffers(command_buffer, 0, &[vb], &[0]);
-            device.cmd_draw(command_buffer, vb_len as u32, 1, 0, 0);
+            device.cmd_bind_vertex_buffers(command_buffer, 0, &[data.vertex_buffer], &[0]);
+            device.cmd_bind_index_buffer(
+                command_buffer,
+                data.index_buffer,
+                0,
+                vk::IndexType::UINT32,
+            );
+            device.cmd_draw_indexed(command_buffer, data.indices.len() as u32, 1, 0, 0, 0);
             device.cmd_end_render_pass(command_buffer);
             device
                 .end_command_buffer(command_buffer)
@@ -1264,17 +1326,18 @@ fn copy_buffer(
     }
 }
 
-fn create_vertex_buffer(
+fn allocate_buffer<T: Sized>(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     device: &ash::Device,
     pool: vk::CommandPool,
     queue: vk::Queue,
-    data: &[Vertex],
+    content: vk::BufferUsageFlags,
+    data: &[T],
 ) -> (vk::Buffer, vk::DeviceMemory) {
     // reminder to future myself:
     // for faster performance disable COHERENT and flush manually
-    let size = (std::mem::size_of::<Vertex>() * data.len()) as u64;
+    let size = (std::mem::size_of::<T>() * data.len()) as u64;
     let (staging_buf, staging_mem) = create_buffer(
         instance,
         physical_device,
@@ -1286,7 +1349,7 @@ fn create_vertex_buffer(
     unsafe {
         let mapped = device
             .map_memory(staging_mem, 0, size, Default::default())
-            .expect("Failed to map memory") as *mut Vertex;
+            .expect("Failed to map memory") as *mut T;
         mapped.copy_from_nonoverlapping(data.as_ptr(), data.len());
         device.unmap_memory(staging_mem);
     }
@@ -1295,7 +1358,7 @@ fn create_vertex_buffer(
         physical_device,
         device,
         size,
-        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::VERTEX_BUFFER,
+        vk::BufferUsageFlags::TRANSFER_DST | content,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     );
     copy_buffer(staging_buf, vertex_buf, size, device, pool, queue);
