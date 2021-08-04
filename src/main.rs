@@ -1,11 +1,12 @@
 use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
 use ash::vk;
-use cgmath::Vector3 as Vec3;
+use cgmath::{perspective, Matrix4, Point3, Rad, Vector3 as Vec3};
 use memoffset::offset_of;
 use platform::create_surface;
 use std::collections::{BTreeSet, HashSet};
 use std::ffi::{CStr, CString};
 use std::ptr;
+use std::time::Instant;
 use validation::{ValidationsRequested, VALIDATION_ON};
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
@@ -75,6 +76,13 @@ const VERTICES: [Vertex; 4] = [
 ];
 
 const INDICES: [u32; 6] = [0, 1, 2, 2, 3, 0];
+
+#[repr(C, packed)]
+struct UniformBufferObject {
+    model: Matrix4<f32>,
+    view: Matrix4<f32>,
+    proj: Matrix4<f32>,
+}
 
 struct SwapchainSupport {
     capabilities: vk::SurfaceCapabilitiesKHR,
@@ -239,6 +247,7 @@ struct VulkanApp {
     swapchain: Swapchain,
     image_views: Vec<vk::ImageView>,
     render_pass: vk::RenderPass,
+    descriptor_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     framebuffers: Vec<vk::Framebuffer>,
@@ -249,6 +258,9 @@ struct VulkanApp {
     acquire_inflight: [vk::Fence; MAX_FRAMES_IN_FLIGHT],
     images_inflight: [vk::Fence; MAX_FRAMES_IN_FLIGHT],
     draw_data: DrawData,
+    u_buf: Vec<vk::Buffer>,
+    u_mem: Vec<vk::DeviceMemory>,
+    start_time: Instant,
     inflight_frame_no: usize,
     resized: bool,
 }
@@ -276,8 +288,11 @@ impl VulkanApp {
             .expect("Failed to get images");
         let image_views = create_image_views(&device, &swapchain, &images);
         let render_pass = create_render_pass(&device, &swapchain);
-        let pipeline_layout = create_pipeline_layout(&device);
+        let descriptor_layout = create_descriptor_set_layout(&device);
+        let pipeline_layout = create_pipeline_layout(&device, &[descriptor_layout]);
         let pipeline = create_graphics_pipeline(&device, &swapchain, render_pass, pipeline_layout);
+        let (u_buf, u_mem) =
+            allocate_uniform_buffers(&instance, physical_device.device, &device, images.len());
         let framebuffers = create_framebuffers(&device, &swapchain, &image_views, render_pass);
         let command_pool = create_command_pool(&device, &physical_device);
         let sem_img_available = create_semaphore(&device);
@@ -330,6 +345,7 @@ impl VulkanApp {
             swapchain,
             image_views,
             render_pass,
+            descriptor_layout,
             pipeline_layout,
             pipeline,
             framebuffers,
@@ -340,6 +356,9 @@ impl VulkanApp {
             acquire_inflight,
             images_inflight: [vk::Fence::null(); MAX_FRAMES_IN_FLIGHT],
             draw_data,
+            u_buf,
+            u_mem,
+            start_time: Instant::now(),
             inflight_frame_no: 0,
             resized: false,
         }
@@ -363,7 +382,8 @@ impl VulkanApp {
                 )
                 .expect("Failed to wait for fence");
         }
-        let image_index;
+        let img_idx_u32;
+        let img_idx_usz;
         let acquire_result = unsafe {
             self.swapchain.loader.acquire_next_image(
                 self.swapchain.swapchain,
@@ -379,7 +399,23 @@ impl VulkanApp {
         } else if acquire_result.is_err() {
             panic!("Failed to acquire image");
         } else {
-            image_index = acquire_result.unwrap().0;
+            img_idx_u32 = acquire_result.unwrap().0;
+            img_idx_usz = img_idx_u32 as usize;
+        }
+        let ar = self.swapchain.extent.width as f32 / self.swapchain.extent.height as f32;
+        let mvp = update_mvp(self.start_time, ar);
+        unsafe {
+            let map = self
+                .device
+                .map_memory(
+                    self.u_mem[img_idx_usz],
+                    0,
+                    std::mem::size_of::<UniformBufferObject>() as u64,
+                    Default::default(),
+                )
+                .expect("Failed to map memory") as *mut UniformBufferObject;
+            map.copy_from_nonoverlapping(&mvp, 1);
+            self.device.unmap_memory(self.u_mem[img_idx_usz]);
         }
         if self.images_inflight[self.inflight_frame_no] != vk::Fence::null() {
             // this frame is currently in use, wait for it
@@ -404,7 +440,7 @@ impl VulkanApp {
             p_wait_semaphores: wait_sem.as_ptr(),
             p_wait_dst_stage_mask: wait_mask.as_ptr(),
             command_buffer_count: 1,
-            p_command_buffers: &self.command_buffers[image_index as usize],
+            p_command_buffers: &self.command_buffers[img_idx_u32 as usize],
             signal_semaphore_count: signal_sem.len() as u32,
             p_signal_semaphores: signal_sem.as_ptr(),
         };
@@ -416,7 +452,7 @@ impl VulkanApp {
             p_wait_semaphores: signal_sem.as_ptr(),
             swapchain_count: swapchains.len() as u32,
             p_swapchains: swapchains.as_ptr(),
-            p_image_indices: &image_index,
+            p_image_indices: &img_idx_u32,
             p_results: ptr::null_mut(),
         };
         unsafe {
@@ -490,7 +526,7 @@ impl VulkanApp {
             .expect("Failed to get images");
         let image_views = create_image_views(&self.device, &swapchain, &images);
         let render_pass = create_render_pass(&self.device, &swapchain);
-        let pipeline_layout = create_pipeline_layout(&self.device);
+        let pipeline_layout = create_pipeline_layout(&self.device, &[self.descriptor_layout]);
         let pipeline =
             create_graphics_pipeline(&self.device, &swapchain, render_pass, pipeline_layout);
         let framebuffers = create_framebuffers(&self.device, &swapchain, &image_views, render_pass);
@@ -503,6 +539,12 @@ impl VulkanApp {
             pipeline,
             &self.draw_data,
         );
+        let (u_buf, u_mem) = allocate_uniform_buffers(
+            &self.instance,
+            self.physical_device.device,
+            &self.device,
+            images.len(),
+        );
         self.swapchain = swapchain;
         self.image_views = image_views;
         self.render_pass = render_pass;
@@ -510,10 +552,18 @@ impl VulkanApp {
         self.pipeline = pipeline;
         self.framebuffers = framebuffers;
         self.command_buffers = command_buffers;
+        self.u_buf = u_buf;
+        self.u_mem = u_mem;
     }
 
     fn destroy_swapchain(&self) {
         unsafe {
+            self.u_buf
+                .iter()
+                .for_each(|x| self.device.destroy_buffer(*x, None));
+            self.u_mem
+                .iter()
+                .for_each(|x| self.device.free_memory(*x, None));
             self.device
                 .free_command_buffers(self.command_pool, &self.command_buffers);
             self.framebuffers
@@ -547,6 +597,8 @@ impl Drop for VulkanApp {
                     .destroy_semaphore(self.sem_img_available[i], None);
                 self.device.destroy_fence(self.acquire_inflight[i], None);
             }
+            self.device
+                .destroy_descriptor_set_layout(self.descriptor_layout, None);
             self.destroy_swapchain();
             self.device.destroy_command_pool(self.command_pool, None);
             self.surface.destroy();
@@ -871,13 +923,16 @@ fn create_image_views(
     retval
 }
 
-fn create_pipeline_layout(device: &ash::Device) -> vk::PipelineLayout {
+fn create_pipeline_layout(
+    device: &ash::Device,
+    layouts: &[vk::DescriptorSetLayout],
+) -> vk::PipelineLayout {
     let layout_ci = vk::PipelineLayoutCreateInfo {
         s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
         p_next: ptr::null(),
         flags: Default::default(),
-        set_layout_count: 0,
-        p_set_layouts: ptr::null(),
+        set_layout_count: layouts.len() as u32,
+        p_set_layouts: layouts.as_ptr(),
         push_constant_range_count: 0,
         p_push_constant_ranges: ptr::null(),
     };
@@ -1369,6 +1424,29 @@ fn allocate_buffer<T: Sized>(
     (vertex_buf, vertex_mem)
 }
 
+fn allocate_uniform_buffers(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    device: &ash::Device,
+    images_no: usize,
+) -> (Vec<vk::Buffer>, Vec<vk::DeviceMemory>) {
+    let size = std::mem::size_of::<UniformBufferObject>() as u64;
+    let (mut r_buf, mut r_mem) = (Vec::with_capacity(images_no), Vec::with_capacity(images_no));
+    for _ in 0..images_no {
+        let (c_buf, c_mem) = create_buffer(
+            instance,
+            physical_device,
+            device,
+            size,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        );
+        r_buf.push(c_buf);
+        r_mem.push(c_mem);
+    }
+    (r_buf, r_mem)
+}
+
 fn find_memory_type(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -1386,6 +1464,38 @@ fn find_memory_type(
         }
     }
     panic!("Failed to find suitable memory")
+}
+
+fn create_descriptor_set_layout(device: &ash::Device) -> vk::DescriptorSetLayout {
+    let ubo_l_bind = [vk::DescriptorSetLayoutBinding {
+        binding: 0,
+        descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+        descriptor_count: 1,
+        stage_flags: vk::ShaderStageFlags::VERTEX,
+        p_immutable_samplers: ptr::null(),
+    }];
+    let l_ci = vk::DescriptorSetLayoutCreateInfo {
+        s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: Default::default(),
+        binding_count: ubo_l_bind.len() as u32,
+        p_bindings: ubo_l_bind.as_ptr(),
+    };
+    unsafe { device.create_descriptor_set_layout(&l_ci, None) }
+        .expect("Failed to create descriptor set layout")
+}
+
+fn update_mvp(start_time: Instant, aspect_ratio: f32) -> UniformBufferObject {
+    let current_time = Instant::now();
+    let elapsed = (current_time - start_time).as_secs() as f32;
+    let model = Matrix4::from_angle_z(Rad(elapsed * (90_f32).to_radians()));
+    let view = Matrix4::look_at_lh(
+        Point3::new(2_f32, 2.0, 2.0),
+        Point3::new(0.0, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, 1.0),
+    );
+    let proj = perspective(Rad(45_f32.to_radians()), aspect_ratio, 0.1, 10.0);
+    UniformBufferObject { model, view, proj }
 }
 
 fn main() {
