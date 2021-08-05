@@ -1,6 +1,6 @@
 use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
-use ash::vk;
-use cgmath::{perspective, Matrix4, Point3, Rad, Vector3 as Vec3};
+use ash::vk::{self, DescriptorSetAllocateInfo, DescriptorSetLayout};
+use cgmath::{perspective, Deg, Matrix4, Point3, Vector3 as Vec3};
 use memoffset::offset_of;
 use platform::create_surface;
 use std::collections::{BTreeSet, HashSet};
@@ -230,6 +230,7 @@ struct DrawData {
     vb_memory: vk::DeviceMemory,
     index_buffer: vk::Buffer,
     ib_memory: vk::DeviceMemory,
+    descriptor_sets: Vec<vk::DescriptorSet>,
     vertices: Vec<Vertex>,
     indices: Vec<u32>,
 }
@@ -248,6 +249,7 @@ struct VulkanApp {
     image_views: Vec<vk::ImageView>,
     render_pass: vk::RenderPass,
     descriptor_layout: vk::DescriptorSetLayout,
+    descriptor_pool: vk::DescriptorPool,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     framebuffers: Vec<vk::Framebuffer>,
@@ -289,10 +291,18 @@ impl VulkanApp {
         let image_views = create_image_views(&device, &swapchain, &images);
         let render_pass = create_render_pass(&device, &swapchain);
         let descriptor_layout = create_descriptor_set_layout(&device);
+        let descriptor_pool = create_descriptor_pool(&device, images.len() as u32);
         let pipeline_layout = create_pipeline_layout(&device, &[descriptor_layout]);
         let pipeline = create_graphics_pipeline(&device, &swapchain, render_pass, pipeline_layout);
         let (u_buf, u_mem) =
             allocate_uniform_buffers(&instance, physical_device.device, &device, images.len());
+        let descriptor_sets = create_descriptor_sets(
+            &device,
+            images.len() as u32,
+            descriptor_pool,
+            descriptor_layout,
+            &u_buf,
+        );
         let framebuffers = create_framebuffers(&device, &swapchain, &image_views, render_pass);
         let command_pool = create_command_pool(&device, &physical_device);
         let sem_img_available = create_semaphore(&device);
@@ -321,6 +331,7 @@ impl VulkanApp {
             vb_memory,
             index_buffer,
             ib_memory,
+            descriptor_sets,
             vertices: VERTICES.to_vec(),
             indices: INDICES.to_vec(),
         };
@@ -330,7 +341,7 @@ impl VulkanApp {
             &framebuffers,
             render_pass,
             &swapchain,
-            pipeline,
+            (pipeline, pipeline_layout),
             &draw_data,
         );
         VulkanApp {
@@ -346,6 +357,7 @@ impl VulkanApp {
             image_views,
             render_pass,
             descriptor_layout,
+            descriptor_pool,
             pipeline_layout,
             pipeline,
             framebuffers,
@@ -526,28 +538,37 @@ impl VulkanApp {
             .expect("Failed to get images");
         let image_views = create_image_views(&self.device, &swapchain, &images);
         let render_pass = create_render_pass(&self.device, &swapchain);
+        let descriptor_pool = create_descriptor_pool(&self.device, images.len() as u32);
         let pipeline_layout = create_pipeline_layout(&self.device, &[self.descriptor_layout]);
         let pipeline =
             create_graphics_pipeline(&self.device, &swapchain, render_pass, pipeline_layout);
         let framebuffers = create_framebuffers(&self.device, &swapchain, &image_views, render_pass);
-        let command_buffers = create_command_buffers(
-            &self.device,
-            self.command_pool,
-            &framebuffers,
-            render_pass,
-            &swapchain,
-            pipeline,
-            &self.draw_data,
-        );
         let (u_buf, u_mem) = allocate_uniform_buffers(
             &self.instance,
             self.physical_device.device,
             &self.device,
             images.len(),
         );
+        self.draw_data.descriptor_sets = create_descriptor_sets(
+            &self.device,
+            images.len() as u32,
+            descriptor_pool,
+            self.descriptor_layout,
+            &u_buf,
+        );
+        let command_buffers = create_command_buffers(
+            &self.device,
+            self.command_pool,
+            &framebuffers,
+            render_pass,
+            &swapchain,
+            (pipeline, pipeline_layout),
+            &self.draw_data,
+        );
         self.swapchain = swapchain;
         self.image_views = image_views;
         self.render_pass = render_pass;
+        self.descriptor_pool = descriptor_pool;
         self.pipeline_layout = pipeline_layout;
         self.pipeline = pipeline;
         self.framebuffers = framebuffers;
@@ -566,6 +587,8 @@ impl VulkanApp {
                 .for_each(|x| self.device.free_memory(*x, None));
             self.device
                 .free_command_buffers(self.command_pool, &self.command_buffers);
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
             self.framebuffers
                 .iter()
                 .for_each(|fb| self.device.destroy_framebuffer(*fb, None));
@@ -1199,7 +1222,7 @@ fn create_command_buffers(
     fbs: &[vk::Framebuffer],
     render_pass: vk::RenderPass,
     swapchain: &Swapchain,
-    pipeline: vk::Pipeline,
+    (pipeline, pipeline_layout): (vk::Pipeline, vk::PipelineLayout),
     data: &DrawData,
 ) -> Vec<vk::CommandBuffer> {
     let alloc_ci = vk::CommandBufferAllocateInfo {
@@ -1214,6 +1237,7 @@ fn create_command_buffers(
     for i in 0..fbs.len() {
         let command_buffer = cmd_buffers[i];
         let framebuffer = fbs[i];
+        let dset = data.descriptor_sets[i];
         let begin_info = vk::CommandBufferBeginInfo {
             s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
             p_next: ptr::null(),
@@ -1245,6 +1269,14 @@ fn create_command_buffers(
                 data.index_buffer,
                 0,
                 vk::IndexType::UINT32,
+            );
+            device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_layout,
+                0,
+                &[dset],
+                &[],
             );
             device.cmd_draw_indexed(command_buffer, data.indices.len() as u32, 1, 0, 0, 0);
             device.cmd_end_render_pass(command_buffer);
@@ -1487,15 +1519,71 @@ fn create_descriptor_set_layout(device: &ash::Device) -> vk::DescriptorSetLayout
 
 fn update_mvp(start_time: Instant, aspect_ratio: f32) -> UniformBufferObject {
     let current_time = Instant::now();
-    let elapsed = (current_time - start_time).as_secs() as f32;
-    let model = Matrix4::from_angle_z(Rad(elapsed * (90_f32).to_radians()));
-    let view = Matrix4::look_at_lh(
+    let elapsed = (current_time - start_time).as_millis() as f32 / 1000.0;
+    let model = Matrix4::from_angle_z(Deg(elapsed * 90_f32));
+    let view = Matrix4::look_at_rh(
         Point3::new(2_f32, 2.0, 2.0),
         Point3::new(0.0, 0.0, 0.0),
-        Vec3::new(0.0, 0.0, 1.0),
+        Vec3::new(0.0, 0.0, -1.0),
     );
-    let proj = perspective(Rad(45_f32.to_radians()), aspect_ratio, 0.1, 10.0);
+    let proj = perspective(Deg(45_f32), aspect_ratio, 0.1, 10.0);
     UniformBufferObject { model, view, proj }
+}
+
+fn create_descriptor_pool(device: &ash::Device, img_no: u32) -> vk::DescriptorPool {
+    let psize = [vk::DescriptorPoolSize {
+        ty: vk::DescriptorType::UNIFORM_BUFFER,
+        descriptor_count: img_no,
+    }];
+    let pci = vk::DescriptorPoolCreateInfo {
+        s_type: vk::StructureType::DESCRIPTOR_POOL_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: Default::default(),
+        max_sets: img_no,
+        pool_size_count: psize.len() as u32,
+        p_pool_sizes: psize.as_ptr(),
+    };
+    unsafe { device.create_descriptor_pool(&pci, None) }.expect("Failed to create descriptor pool")
+}
+
+fn create_descriptor_sets(
+    device: &ash::Device,
+    img_no: u32,
+    pool: vk::DescriptorPool,
+    layout: DescriptorSetLayout,
+    bufs: &[vk::Buffer],
+) -> Vec<vk::DescriptorSet> {
+    let layouts = vec![layout; img_no as usize];
+    let ci = DescriptorSetAllocateInfo {
+        s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
+        p_next: ptr::null(),
+        descriptor_pool: pool,
+        descriptor_set_count: img_no,
+        p_set_layouts: layouts.as_ptr(),
+    };
+    let sets =
+        unsafe { device.allocate_descriptor_sets(&ci) }.expect("Failed to allocate descriptor set");
+    for (i, descriptor) in sets.iter().enumerate() {
+        let bci = [vk::DescriptorBufferInfo {
+            buffer: bufs[i],
+            offset: 0,
+            range: std::mem::size_of::<UniformBufferObject>() as u64,
+        }];
+        let write_ci = vk::WriteDescriptorSet {
+            s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+            p_next: ptr::null(),
+            dst_set: *descriptor,
+            dst_binding: 0,
+            dst_array_element: 0,
+            descriptor_count: bci.len() as u32,
+            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+            p_image_info: ptr::null(),
+            p_buffer_info: bci.as_ptr(),
+            p_texel_buffer_view: ptr::null(),
+        };
+        unsafe { device.update_descriptor_sets(&[write_ci], &[]) };
+    }
+    sets
 }
 
 fn main() {
