@@ -1,5 +1,4 @@
-use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
-use ash::vk::{self, DescriptorSetAllocateInfo, DescriptorSetLayout};
+use ash::vk;
 use cgmath::{perspective, Deg, Matrix4, Point3, Vector3 as Vec3};
 use memoffset::offset_of;
 use platform::create_surface;
@@ -641,9 +640,9 @@ fn create_instance(entry: &ash::Entry, validations: &ValidationsRequested) -> as
         s_type: vk::StructureType::APPLICATION_INFO,
         p_next: ptr::null(),
         p_application_name: window_name.as_ptr(),
-        application_version: vk::make_version(0, 1, 0),
+        application_version: vk::make_api_version(0, 1, 0, 0),
         p_engine_name: engine_name.as_ptr(),
-        engine_version: vk::make_version(0, 1, 0),
+        engine_version: vk::make_api_version(0, 1, 0, 0),
         api_version: vk::API_VERSION_1_2,
     };
     let required_extensions = platform::required_extension_names();
@@ -1550,11 +1549,11 @@ fn create_descriptor_sets(
     device: &ash::Device,
     img_no: u32,
     pool: vk::DescriptorPool,
-    layout: DescriptorSetLayout,
+    layout: vk::DescriptorSetLayout,
     bufs: &[vk::Buffer],
 ) -> Vec<vk::DescriptorSet> {
     let layouts = vec![layout; img_no as usize];
-    let ci = DescriptorSetAllocateInfo {
+    let ci = vk::DescriptorSetAllocateInfo {
         s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
         p_next: ptr::null(),
         descriptor_pool: pool,

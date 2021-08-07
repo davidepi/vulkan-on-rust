@@ -1,4 +1,3 @@
-use ash::version::EntryV1_0;
 use std::{
     collections::HashSet,
     ffi::{CStr, CString},

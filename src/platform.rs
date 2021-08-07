@@ -69,7 +69,7 @@ pub unsafe fn create_surface(
         };
 
         let macos_surface_loader = ash::extensions::mvk::MacOSSurface::new(entry, instance);
-        macos_surface_loader.create_mac_os_surface_mvk(&create_info, None)
+        macos_surface_loader.create_mac_os_surface(&create_info, None)
     }
     #[cfg(target_os = "windows")]
     {
