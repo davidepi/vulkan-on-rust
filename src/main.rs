@@ -1,5 +1,5 @@
 use ash::vk;
-use cgmath::{perspective, Deg, Matrix4, Point3, Vector3 as Vec3};
+use cgmath::{perspective, Deg, Matrix4, Point3, Vector2 as Vec2, Vector3 as Vec3};
 use memoffset::offset_of;
 use platform::create_surface;
 use std::collections::{BTreeSet, HashSet};
@@ -36,6 +36,7 @@ const VERTICES: [Vertex; 4] = [
             y: 0.0,
             z: 0.0,
         },
+        vt: Vec2 { x: 1.0, y: 0.0 },
     },
     Vertex {
         position: Vec3 {
@@ -48,6 +49,7 @@ const VERTICES: [Vertex; 4] = [
             y: 1.0,
             z: 0.0,
         },
+        vt: Vec2 { x: 0.0, y: 0.0 },
     },
     Vertex {
         position: Vec3 {
@@ -60,6 +62,7 @@ const VERTICES: [Vertex; 4] = [
             y: 0.0,
             z: 1.0,
         },
+        vt: Vec2 { x: 0.0, y: 1.0 },
     },
     Vertex {
         position: Vec3 {
@@ -72,6 +75,7 @@ const VERTICES: [Vertex; 4] = [
             y: 1.0,
             z: 1.0,
         },
+        vt: Vec2 { x: 1.0, y: 1.0 },
     },
 ];
 
@@ -182,24 +186,10 @@ impl Swapchain {
 struct Vertex {
     position: Vec3<f32>,
     color: Vec3<f32>,
+    vt: Vec2<f32>,
 }
 
 impl Vertex {
-    fn new(values: [f32; 6]) -> Vertex {
-        Vertex {
-            position: Vec3 {
-                x: values[0],
-                y: values[1],
-                z: values[2],
-            },
-            color: Vec3 {
-                x: values[3],
-                y: values[4],
-                z: values[5],
-            },
-        }
-    }
-
     fn binding_descriptions() -> [vk::VertexInputBindingDescription; 1] {
         [vk::VertexInputBindingDescription {
             binding: 0,
@@ -208,7 +198,7 @@ impl Vertex {
         }]
     }
 
-    fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
+    fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 3] {
         [
             vk::VertexInputAttributeDescription {
                 location: 0,
@@ -221,6 +211,12 @@ impl Vertex {
                 binding: 0,
                 format: vk::Format::R32G32B32_SFLOAT,
                 offset: offset_of!(Vertex, color) as u32,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 2,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: offset_of!(Vertex, vt) as u32,
             },
         ]
     }
@@ -299,17 +295,31 @@ impl VulkanApp {
         let descriptor_pool = create_descriptor_pool(&device, images.len() as u32);
         let pipeline_layout = create_pipeline_layout(&device, &[descriptor_layout]);
         let pipeline = create_graphics_pipeline(&device, &swapchain, render_pass, pipeline_layout);
+        let command_pool = create_command_pool(&device, &physical_device);
         let (u_buf, u_mem) =
             allocate_uniform_buffers(&instance, physical_device.device, &device, images.len());
+        let (tex_buf, tex_mem) = create_texture(
+            &instance,
+            physical_device.device,
+            &device,
+            command_pool,
+            graphics_queue,
+        );
+        let tex_iw = create_image_view(&device, tex_buf, vk::Format::R8G8B8A8_SRGB);
+        let sampler = create_texture_sampler(
+            &device,
+            physical_device.properties.limits.max_sampler_anisotropy,
+        );
         let descriptor_sets = create_descriptor_sets(
             &device,
             images.len() as u32,
             descriptor_pool,
             descriptor_layout,
             &u_buf,
+            tex_iw,
+            sampler,
         );
         let framebuffers = create_framebuffers(&device, &swapchain, &image_views, render_pass);
-        let command_pool = create_command_pool(&device, &physical_device);
         let sem_img_available = create_semaphore(&device);
         let sem_render_finish = create_semaphore(&device);
         let acquire_inflight = create_fence(&device);
@@ -331,13 +341,7 @@ impl VulkanApp {
             vk::BufferUsageFlags::INDEX_BUFFER,
             &INDICES,
         );
-        let (tex_buf, tex_mem) = create_texture(
-            &instance,
-            physical_device.device,
-            &device,
-            command_pool,
-            graphics_queue,
-        );
+
         let draw_data = DrawData {
             vertex_buffer,
             vb_memory,
@@ -346,14 +350,11 @@ impl VulkanApp {
             descriptor_sets,
             tex_buf,
             tex_mem,
-            tex_iw: create_image_view(&device, tex_buf, vk::Format::R8G8B8A8_SRGB),
+            tex_iw,
             vertices: VERTICES.to_vec(),
             indices: INDICES.to_vec(),
         };
-        let sampler = create_texture_sampler(
-            &device,
-            physical_device.properties.limits.max_sampler_anisotropy,
-        );
+
         let commands = create_command_buffers(
             &device,
             command_pool,
@@ -575,6 +576,8 @@ impl VulkanApp {
             descriptor_pool,
             self.descriptor_layout,
             &u_buf,
+            self.draw_data.tex_iw,
+            self.sampler,
         );
         let command_buffers = create_command_buffers(
             &self.device,
@@ -1526,19 +1529,28 @@ fn find_memory_type(
 }
 
 fn create_descriptor_set_layout(device: &ash::Device) -> vk::DescriptorSetLayout {
-    let ubo_l_bind = [vk::DescriptorSetLayoutBinding {
-        binding: 0,
-        descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
-        descriptor_count: 1,
-        stage_flags: vk::ShaderStageFlags::VERTEX,
-        p_immutable_samplers: ptr::null(),
-    }];
+    let binds = [
+        vk::DescriptorSetLayoutBinding {
+            binding: 0,
+            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::VERTEX,
+            p_immutable_samplers: ptr::null(),
+        },
+        vk::DescriptorSetLayoutBinding {
+            binding: 1,
+            descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::FRAGMENT,
+            p_immutable_samplers: ptr::null(),
+        },
+    ];
     let l_ci = vk::DescriptorSetLayoutCreateInfo {
         s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         p_next: ptr::null(),
         flags: Default::default(),
-        binding_count: ubo_l_bind.len() as u32,
-        p_bindings: ubo_l_bind.as_ptr(),
+        binding_count: binds.len() as u32,
+        p_bindings: binds.as_ptr(),
     };
     unsafe { device.create_descriptor_set_layout(&l_ci, None) }
         .expect("Failed to create descriptor set layout")
@@ -1558,10 +1570,16 @@ fn update_mvp(start_time: Instant, aspect_ratio: f32) -> UniformBufferObject {
 }
 
 fn create_descriptor_pool(device: &ash::Device, img_no: u32) -> vk::DescriptorPool {
-    let psize = [vk::DescriptorPoolSize {
-        ty: vk::DescriptorType::UNIFORM_BUFFER,
-        descriptor_count: img_no,
-    }];
+    let psize = [
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::UNIFORM_BUFFER,
+            descriptor_count: img_no,
+        },
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            descriptor_count: img_no,
+        },
+    ];
     let pci = vk::DescriptorPoolCreateInfo {
         s_type: vk::StructureType::DESCRIPTOR_POOL_CREATE_INFO,
         p_next: ptr::null(),
@@ -1579,6 +1597,8 @@ fn create_descriptor_sets(
     pool: vk::DescriptorPool,
     layout: vk::DescriptorSetLayout,
     bufs: &[vk::Buffer],
+    tex_view: vk::ImageView,
+    sampler: vk::Sampler,
 ) -> Vec<vk::DescriptorSet> {
     let layouts = vec![layout; img_no as usize];
     let ci = vk::DescriptorSetAllocateInfo {
@@ -1596,19 +1616,38 @@ fn create_descriptor_sets(
             offset: 0,
             range: std::mem::size_of::<UniformBufferObject>() as u64,
         }];
-        let write_ci = vk::WriteDescriptorSet {
-            s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-            p_next: ptr::null(),
-            dst_set: *descriptor,
-            dst_binding: 0,
-            dst_array_element: 0,
-            descriptor_count: bci.len() as u32,
-            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
-            p_image_info: ptr::null(),
-            p_buffer_info: bci.as_ptr(),
-            p_texel_buffer_view: ptr::null(),
-        };
-        unsafe { device.update_descriptor_sets(&[write_ci], &[]) };
+        let ici = [vk::DescriptorImageInfo {
+            sampler,
+            image_view: tex_view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
+        let write_ci = [
+            vk::WriteDescriptorSet {
+                s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                p_next: ptr::null(),
+                dst_set: *descriptor,
+                dst_binding: 0,
+                dst_array_element: 0,
+                descriptor_count: bci.len() as u32,
+                descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                p_image_info: ptr::null(),
+                p_buffer_info: bci.as_ptr(),
+                p_texel_buffer_view: ptr::null(),
+            },
+            vk::WriteDescriptorSet {
+                s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                p_next: ptr::null(),
+                dst_set: *descriptor,
+                dst_binding: 1,
+                dst_array_element: 0,
+                descriptor_count: ici.len() as u32,
+                descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                p_image_info: ici.as_ptr(),
+                p_buffer_info: ptr::null(),
+                p_texel_buffer_view: ptr::null(),
+            },
+        ];
+        unsafe { device.update_descriptor_sets(&write_ci, &[]) };
     }
     sets
 }
