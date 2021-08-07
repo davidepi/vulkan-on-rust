@@ -92,6 +92,7 @@ struct SwapchainSupport {
 
 struct PDeviceAndQueues {
     device: vk::PhysicalDevice,
+    properties: vk::PhysicalDeviceProperties,
     queue_family: QueueFamilyIndices,
 }
 
@@ -232,6 +233,7 @@ struct DrawData {
     ib_memory: vk::DeviceMemory,
     tex_buf: vk::Image,
     tex_mem: vk::DeviceMemory,
+    tex_iw: vk::ImageView,
     descriptor_sets: Vec<vk::DescriptorSet>,
     vertices: Vec<Vertex>,
     indices: Vec<u32>,
@@ -265,6 +267,7 @@ struct VulkanApp {
     u_buf: Vec<vk::Buffer>,
     u_mem: Vec<vk::DeviceMemory>,
     start_time: Instant,
+    sampler: vk::Sampler,
     inflight_frame_no: usize,
     resized: bool,
 }
@@ -343,9 +346,14 @@ impl VulkanApp {
             descriptor_sets,
             tex_buf,
             tex_mem,
+            tex_iw: create_image_view(&device, tex_buf, vk::Format::R8G8B8A8_SRGB),
             vertices: VERTICES.to_vec(),
             indices: INDICES.to_vec(),
         };
+        let sampler = create_texture_sampler(
+            &device,
+            physical_device.properties.limits.max_sampler_anisotropy,
+        );
         let commands = create_command_buffers(
             &device,
             command_pool,
@@ -381,6 +389,7 @@ impl VulkanApp {
             draw_data,
             u_buf,
             u_mem,
+            sampler,
             start_time: Instant::now(),
             inflight_frame_no: 0,
             resized: false,
@@ -618,6 +627,8 @@ impl VulkanApp {
 impl Drop for VulkanApp {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_sampler(self.sampler, None);
+            self.device.destroy_image_view(self.draw_data.tex_iw, None);
             self.device.free_memory(self.draw_data.tex_mem, None);
             self.device.destroy_image(self.draw_data.tex_buf, None);
             self.device.free_memory(self.draw_data.ib_memory, None);
@@ -705,7 +716,7 @@ fn rate_physical_device_suitability(
     surface: &Surface,
 ) -> Option<(u32, PDeviceAndQueues)> {
     let device_properties = unsafe { instance.get_physical_device_properties(physical_device) };
-    // let device_features = unsafe { instance.get_physical_device_features(physical_device) };
+    let device_features = unsafe { instance.get_physical_device_features(physical_device) };
     let score = match device_properties.device_type {
         vk::PhysicalDeviceType::DISCRETE_GPU => 1000,
         vk::PhysicalDeviceType::INTEGRATED_GPU => 100,
@@ -713,7 +724,9 @@ fn rate_physical_device_suitability(
         vk::PhysicalDeviceType::OTHER => 10,
         _ => 10,
     };
-    if device_support_requested_extensions(instance, physical_device) {
+    if device_support_requested_extensions(instance, physical_device)
+        && device_features.sampler_anisotropy == vk::TRUE
+    {
         let queue_family = find_queue_families(instance, physical_device, surface);
         let swapchain = query_swapchain_capabilities(surface, physical_device);
         if let Some(queue_family) = queue_family.get_complete() {
@@ -722,6 +735,7 @@ fn rate_physical_device_suitability(
                     score,
                     PDeviceAndQueues {
                         device: physical_device,
+                        properties: device_properties,
                         queue_family,
                     },
                 ))
@@ -799,9 +813,10 @@ fn create_logical_device(
         queue_create_infos.push(queue_create_info);
     }
 
-    let physical_features = vk::PhysicalDeviceFeatures {
+    let mut physical_features = vk::PhysicalDeviceFeatures {
         ..Default::default()
     };
+    physical_features.sampler_anisotropy = vk::TRUE;
     let required_device_extensions = device_required_features()
         .into_iter()
         .map(|x| x.as_ptr())
@@ -932,31 +947,10 @@ fn create_image_views(
     swapchain: &Swapchain,
     images: &[vk::Image],
 ) -> Vec<vk::ImageView> {
-    let mut retval = Vec::with_capacity(images.len());
-    for image in images {
-        let subresource_range = vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        };
-        let create_info = vk::ImageViewCreateInfo {
-            s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
-            p_next: ptr::null(),
-            flags: vk::ImageViewCreateFlags::default(),
-            image: *image,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: swapchain.image_format,
-            components: vk::ComponentMapping::default(),
-            subresource_range,
-        };
-        retval.push(
-            unsafe { device.create_image_view(&create_info, None) }
-                .expect("Failed to create Image View"),
-        );
-    }
-    retval
+    images
+        .iter()
+        .map(|&img| create_image_view(device, img, swapchain.image_format))
+        .collect()
 }
 
 fn create_pipeline_layout(
@@ -1628,6 +1622,8 @@ fn create_texture(
 ) -> (vk::Image, vk::DeviceMemory) {
     let bytes = include_bytes!("./textures/texture.jpg");
     let img = image::io::Reader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .expect("Failed to guess texture format")
         .decode()
         .expect("Failed to load image")
         .to_rgba8();
@@ -1655,6 +1651,7 @@ fn create_texture(
     layout_transition(
         device,
         pool,
+        queue,
         img_buf,
         format,
         vk::ImageLayout::UNDEFINED,
@@ -1664,6 +1661,7 @@ fn create_texture(
     layout_transition(
         device,
         pool,
+        queue,
         img_buf,
         format,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -1727,6 +1725,7 @@ fn create_image(
 fn layout_transition(
     device: &ash::Device,
     pool: vk::CommandPool,
+    queue: vk::Queue,
     image: vk::Image,
     format: vk::Format,
     old: vk::ImageLayout,
@@ -1782,6 +1781,7 @@ fn layout_transition(
             &[img_barr],
         )
     };
+    end_single_command(device, cmd_buf, queue, pool);
 }
 
 fn copy_buffer_to_image(
@@ -1821,6 +1821,51 @@ fn copy_buffer_to_image(
         )
     }
     end_single_command(device, cmd_buf, queue, pool);
+}
+
+fn create_image_view(device: &ash::Device, img: vk::Image, format: vk::Format) -> vk::ImageView {
+    let subresource_range = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    let iw_ci = vk::ImageViewCreateInfo {
+        s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: Default::default(),
+        image: img,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format,
+        components: vk::ComponentMapping::default(),
+        subresource_range,
+    };
+    unsafe { device.create_image_view(&iw_ci, None) }.expect("Failed to create Image View")
+}
+
+fn create_texture_sampler(device: &ash::Device, max_anisotropy: f32) -> vk::Sampler {
+    let samci = vk::SamplerCreateInfo {
+        s_type: vk::StructureType::SAMPLER_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: Default::default(),
+        mag_filter: vk::Filter::LINEAR,
+        min_filter: vk::Filter::LINEAR,
+        mipmap_mode: vk::SamplerMipmapMode::LINEAR,
+        address_mode_u: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+        address_mode_v: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+        address_mode_w: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+        mip_lod_bias: 0.0,
+        anisotropy_enable: vk::TRUE,
+        max_anisotropy,
+        compare_enable: vk::FALSE,
+        compare_op: vk::CompareOp::default(),
+        min_lod: 0.0,
+        max_lod: 0.0,
+        border_color: vk::BorderColor::INT_OPAQUE_BLACK,
+        unnormalized_coordinates: vk::FALSE,
+    };
+    unsafe { device.create_sampler(&samci, None) }.expect("Failed to create sampler")
 }
 
 fn main() {
